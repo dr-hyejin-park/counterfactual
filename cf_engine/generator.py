@@ -86,6 +86,53 @@ class TabDiffCFGenerator:
 
         return self.preprocessor.inverse_transform(x_cf.cpu().numpy())
 
+    def generate_for_batch(
+        self,
+        customer_df: pd.DataFrame,
+        num_candidates: int = 2,
+    ) -> List[pd.DataFrame]:
+        """
+        여러 고객을 한 번의 diffusion pass로 처리 (대규모 처리 최적화)
+
+        전략: 각 고객을 num_candidates개 복제 → 단일 대형 배치로 역확산
+        처리량: 고객당 개별 처리 대비 N배 빠름 (GPU 환경에서 효과 극대화)
+
+        Args:
+            customer_df:    고객 DataFrame (n행)
+            num_candidates: 고객당 후보 CF 수 (대규모 시 2개 권장)
+        Returns:
+            cf_list: 고객별 CF 후보 DataFrame 리스트 (n개)
+        """
+        n = len(customer_df)
+        x_factual_np = self.preprocessor.transform(
+            customer_df[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]
+        )  # (n, dim)
+
+        # 각 고객을 num_candidates번 복제 → [c1,c1, c2,c2, ...] 순서
+        x_factual_repeated = np.repeat(x_factual_np, num_candidates, axis=0)  # (n*k, dim)
+        x_factual_t = torch.tensor(x_factual_repeated, dtype=torch.float32, device=self.device)
+
+        # 단일 대형 배치로 역확산 수행
+        x_cf_all = self.tabdiff.generate_counterfactual_trajectory(
+            x_factual=x_factual_t,
+            t_start=self.cfg["num_cf_timesteps"],
+            guidance_fn=self._guidance_fn,
+            guidance_scale=self.cfg["guidance_scale"],
+            constraint_fn=lambda xc, xf: self.constraints.apply(xc, xf),
+        )  # (n*k, dim)
+
+        x_cf_np = x_cf_all.cpu().numpy()
+
+        # 고객별 슬라이스로 분리 → 개별 DataFrame
+        cf_list = []
+        for i in range(n):
+            start = i * num_candidates
+            end   = start + num_candidates
+            cf_list.append(
+                self.preprocessor.inverse_transform(x_cf_np[start:end])
+            )
+        return cf_list
+
     def select_best_cf(self, cf_candidates: pd.DataFrame,
                         factual_row: pd.Series) -> pd.Series:
         """
@@ -408,3 +455,88 @@ def _print_wakeup_actions(treatments: List[Dict], factual: pd.Series) -> None:
             seen.add(a)
         if len(seen) >= 3:
             break
+
+
+# ─── 대규모 처리용 결과 직렬화 헬퍼 ────────────────────────────────────────────
+
+ACTION_TAG = {
+    "days_since_app_login":      "앱재참여",
+    "avg_spending_3m":           "사용실적증대",
+    "monthly_txn_count_3m":      "결제빈도증가",
+    "num_missed_months":         "연속사용유지",
+    "num_active_benefits":       "혜택등록유도",
+    "loyalty_points_balance":    "포인트소진",
+    "spending_trend_ratio":      "트렌드반전",
+    "months_since_last_txn":     "거래재개",
+    "engagement_level":          "디지털참여강화",
+    "payment_method":            "결제수단전환",
+    "primary_spending_category": "카테고리확장",
+}
+
+
+def build_treatment_rows(result: dict) -> dict:
+    """
+    CF 결과 dict → 와이드 포맷 행(row)
+    고객 × 피처별 변화(orig/cf/delta/pct) + 캠페인 액션 태그
+    """
+    row = {
+        "customer_id":  result["customer_id"],
+        "risk_prob":    round(result["factual_prob"], 4),
+        "cf_risk_prob": round(result["cf_prob"], 4),
+        "risk_drop":    round(result["factual_prob"] - result["cf_prob"], 4),
+        "cf_valid":     result["cf_valid"],
+        "num_changes":  result["num_changes"],
+        "card_tier":         result["factual"].get("card_tier", "-"),
+        "years_as_customer": result["factual"].get("years_as_customer", 0),
+        "engagement_level":  result["factual"].get("engagement_level", "-"),
+    }
+    for feat in NUMERICAL_FEATURES:
+        orig = float(result["factual"].get(feat, 0))
+        cf   = float(result["counterfactual"].get(feat, 0))
+        row[f"{feat}_orig"]  = orig
+        row[f"{feat}_cf"]    = cf
+        row[f"{feat}_delta"] = round(cf - orig, 2)
+        row[f"{feat}_pct"]   = round((cf - orig) / orig * 100, 1) if orig != 0 else 0.0
+    for feat in CATEGORICAL_FEATURES:
+        row[f"{feat}_orig"]    = str(result["factual"].get(feat, ""))
+        row[f"{feat}_cf"]      = str(result["counterfactual"].get(feat, ""))
+        row[f"{feat}_changed"] = int(row[f"{feat}_orig"] != row[f"{feat}_cf"])
+    action_tags = [ACTION_TAG.get(t["feature"], t["feature"]) for t in result["treatments"]]
+    row["action_tags"] = " | ".join(action_tags)
+    row["num_actions"] = len(action_tags)
+    return row
+
+
+def build_action_rows(result: dict) -> list:
+    """
+    CF 결과 dict → 롱 포맷 행 리스트 (고객 × treatment 1행)
+    """
+    rows = []
+    for t in result["treatments"]:
+        feat = t["feature"]
+        unit = _feat_unit(feat)
+        if t["type"] == "numerical":
+            orig_str = f"{t['original']:.1f}{unit}"
+            cf_str   = f"{t['counterfactual']:.1f}{unit}"
+            change   = f"{t['direction']}{abs(t['delta']):.1f} ({abs(t['pct_change']):.0f}%)"
+        else:
+            orig_str = _translate_cat(feat, str(t["original"]))
+            cf_str   = _translate_cat(feat, str(t["counterfactual"]))
+            change   = f"→ {cf_str}"
+        rows.append({
+            "customer_id":  result["customer_id"],
+            "risk_prob":    round(result["factual_prob"], 4),
+            "cf_risk_prob": round(result["cf_prob"], 4),
+            "cf_valid":     result["cf_valid"],
+            "card_tier":    result["factual"].get("card_tier", "-"),
+            "feature":      feat,
+            "feature_kr":   _feat_name_kr(feat),
+            "action_tag":   ACTION_TAG.get(feat, feat),
+            "original":     orig_str,
+            "target":       cf_str,
+            "change":       change,
+            "direction":    t["direction"],
+            "pct_change":   t.get("pct_change"),
+            "type":         t["type"],
+        })
+    return rows
