@@ -1,19 +1,20 @@
 """
-TabDiff 기반 Counterfactual Explanation 생성기
+TabDiff 기반 무실적 위험 고객 Wake-up Counterfactual 생성기
 
-논문 알고리즘 구현:
-  Input : 원본 고객 데이터 x_factual (클래스 0 — 추가 발급 거절)
-  Output: 반사실적 x_cf (클래스 1 — 추가 발급 승인)으로 변경하는 최소한의 변화
+[Use Case]
+- 대상: inactive_risk = 1로 예측된 고객 (무실적 위험군)
+- 목표: inactive_risk = 0 (활성 고객) 상태로 전환하기 위한 최소 변화 도출
+- 출력: 고객별 맞춤형 Wake-up Treatment 권고안
 
-알고리즘 (논문 Algorithm 1 응용):
-  1. x_factual을 인코딩
-  2. 부분 노이즈 추가: x_{T_cf} ~ q(x_{T_cf} | x_factual)
-  3. t = T_cf, ..., 1 역확산:
-       x_{t-1} = DDPM_reverse(x_t, t)
-                 + λ * ∇_{x_t} log p(y=1 | x_t)  [classifier guidance]
-       x_{t-1} = apply_constraints(x_{t-1}, x_factual)  [행동 가능성]
-  4. x_0 디코딩 → 원래 스케일
-  5. 후보 중 proximity 최소 + validity 최대 선택
+[알고리즘]
+1. x_factual(무실적 위험 고객) 인코딩
+2. x_{T_cf} = q(x_{T_cf} | x_factual)  ← 부분 노이즈 추가
+3. for t = T_cf, ..., 1:
+     ε̃ = ε_θ(x_t, t) - λ√(1-ᾱ_t) · ∇_{x_t} log P(y=0|x_t)   ← 클래스 0(활성) 방향 유도
+     x_{t-1} = DDPM_reverse(x_t, ε̃)
+     x_{t-1} = apply_constraints(x_{t-1}, x_factual)
+4. 디코딩 → 원래 스케일
+5. 후보 중 validity 최대 + proximity 최소 선택
 """
 
 import numpy as np
@@ -25,34 +26,25 @@ from tqdm import tqdm
 from config import (
     NUMERICAL_FEATURES, CATEGORICAL_FEATURES, CATEGORICAL_VALUES,
     IMMUTABLE_FEATURES, INCREASING_ONLY_FEATURES, DECREASING_ONLY_FEATURES,
-    CF_CONFIG,
+    CF_CONFIG, TARGET_COLUMN,
 )
 from cf_engine.constraints import (
     ActionabilityConstraints,
     compute_proximity,
     compute_sparsity,
-    compute_validity,
 )
 
 
 class TabDiffCFGenerator:
     """
-    TabDiff 기반 반사실적 설명 생성기
+    TabDiff 기반 무실적 위험 고객 Wake-up Counterfactual 생성기
 
-    마케팅 활용:
-    - 추가 카드 발급 거절 고객(class 0)에 대해
-    - 최소한의 변화로 승인(class 1) 받을 수 있는 시나리오 생성
-    - 각 고객별 맞춤형 Treatment 권고안 제시
+    목표 클래스: inactive_risk = 0 (활성 고객)
+    → classifier guidance: ∇ log P(y=0|x_t) = -∇ log P(y=1|x_t) 방향으로 유도
     """
 
-    def __init__(
-        self,
-        tabdiff_model,
-        classifier,
-        preprocessor,
-        device: str = "cpu",
-        cf_config: Optional[Dict] = None,
-    ):
+    def __init__(self, tabdiff_model, classifier, preprocessor,
+                 device: str = "cpu", cf_config: Optional[Dict] = None):
         self.tabdiff = tabdiff_model.to(device)
         self.tabdiff.eval()
         self.classifier = classifier.to(device)
@@ -60,72 +52,45 @@ class TabDiffCFGenerator:
         self.preprocessor = preprocessor
         self.device = device
         self.cfg = cf_config or CF_CONFIG
-
-        # 행동 가능성 제약
         self.constraints = ActionabilityConstraints(preprocessor)
 
     def _guidance_fn(self, x_t: torch.Tensor) -> torch.Tensor:
         """
-        Classifier guidance: log P(y=1 | x_t)
-        TabDiff 역확산 방향을 클래스 1(추가 발급 승인)로 유도
+        Classifier guidance: log P(y=0 | x_t) = log(1 - σ(f(x_t)))
+        목표 클래스 0(활성 고객) 방향으로 역확산 유도
         """
-        return self.classifier.log_prob_target(x_t)
+        import torch.nn.functional as F
+        logit = self.classifier(x_t)          # (batch,)
+        # log P(y=0|x) = log(1 - sigmoid(logit)) = log sigmoid(-logit)
+        return F.logsigmoid(-logit)
 
-    def generate_for_customer(
-        self,
-        customer_row: pd.Series,
-        num_candidates: int = 5,
-        verbose: bool = False,
-    ) -> pd.DataFrame:
-        """
-        단일 고객에 대한 반사실적 후보 생성
-
-        Args:
-            customer_row: 고객 데이터 (pd.Series, 피처만 포함)
-            num_candidates: 생성할 후보 수
-            verbose: 진행 상황 출력
-
-        Returns:
-            cf_candidates: 반사실적 후보 DataFrame (num_candidates 행)
-        """
-        # 인코딩
+    def generate_for_customer(self, customer_row: pd.Series,
+                               num_candidates: int = 5) -> pd.DataFrame:
+        """단일 고객에 대한 반사실적 후보 생성"""
         x_factual_np = self.preprocessor.transform(
             pd.DataFrame([customer_row[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]])
-        )  # (1, total_dim)
-
-        # 후보 생성을 위해 배치 복제
+        )
         x_factual = torch.tensor(
             np.repeat(x_factual_np, num_candidates, axis=0),
             dtype=torch.float32,
             device=self.device,
-        )  # (num_candidates, total_dim)
+        )
 
-        t_start = self.cfg["num_cf_timesteps"]
-        guidance_scale = self.cfg["guidance_scale"]
-
-        # 반사실적 역확산 생성
         x_cf = self.tabdiff.generate_counterfactual_trajectory(
             x_factual=x_factual,
-            t_start=t_start,
+            t_start=self.cfg["num_cf_timesteps"],
             guidance_fn=self._guidance_fn,
-            guidance_scale=guidance_scale,
+            guidance_scale=self.cfg["guidance_scale"],
             constraint_fn=lambda xc, xf: self.constraints.apply(xc, xf),
-        )  # (num_candidates, total_dim)
+        )
 
-        # 디코딩 → 원래 스케일
-        x_cf_np = x_cf.cpu().numpy()
-        cf_df = self.preprocessor.inverse_transform(x_cf_np)
+        return self.preprocessor.inverse_transform(x_cf.cpu().numpy())
 
-        return cf_df
-
-    def select_best_cf(
-        self,
-        cf_candidates: pd.DataFrame,
-        factual_row: pd.Series,
-    ) -> pd.Series:
+    def select_best_cf(self, cf_candidates: pd.DataFrame,
+                        factual_row: pd.Series) -> pd.Series:
         """
-        후보 반사실적 중 가장 좋은 것 선택
-        기준: 분류기 신뢰도 최대 + 원본과의 거리 최소
+        후보 중 최적 CF 선택
+        기준: 분류기가 활성(0)으로 예측 + 원본과 거리 최소
         """
         x_factual_np = self.preprocessor.transform(
             pd.DataFrame([factual_row[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]])
@@ -133,17 +98,14 @@ class TabDiffCFGenerator:
         x_cf_np = self.preprocessor.transform(
             cf_candidates[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]
         )
-
-        # 분류기 예측 확률
         x_cf_tensor = torch.tensor(x_cf_np, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             cf_probs = self.classifier.predict_proba(x_cf_tensor).cpu().numpy()
 
-        # 유효한 CF만 (p(y=1) > 0.5)
-        valid_mask = cf_probs > 0.5
+        # 활성 고객 예측: prob < 0.5 (inactive_risk=0)
+        valid_mask = cf_probs < 0.5
         if valid_mask.any():
             valid_idx = np.where(valid_mask)[0]
-            # 유효한 것 중 원본과 거리 최소
             dists = np.linalg.norm(
                 x_cf_np[valid_idx, :self.preprocessor.num_dim]
                 - x_factual_np[:, :self.preprocessor.num_dim],
@@ -151,64 +113,47 @@ class TabDiffCFGenerator:
             )
             best_idx = valid_idx[np.argmin(dists)]
         else:
-            # 유효한 CF가 없으면 확률 최대인 것 선택
-            best_idx = int(np.argmax(cf_probs))
+            # 유효한 CF 없으면 확률 최소(가장 활성에 가까운) 선택
+            best_idx = int(np.argmin(cf_probs))
 
         return cf_candidates.iloc[best_idx]
 
-    def explain(
-        self,
-        customer_df: pd.DataFrame,
-        max_customers: int = 20,
-        verbose: bool = True,
-    ) -> List[Dict]:
+    def explain(self, customer_df: pd.DataFrame,
+                max_customers: int = 20, verbose: bool = True) -> List[Dict]:
         """
-        여러 고객에 대한 반사실적 설명 일괄 생성
-
-        추가 발급 거절(0) 고객들에 대해 승인(1)을 위한
-        맞춤형 Treatment 권고안 생성
+        무실적 위험 고객 일괄 CF 설명 생성
 
         Args:
-            customer_df: 고객 데이터 DataFrame (타겟 컬럼 포함)
+            customer_df: 고객 데이터 (타겟 컬럼 포함)
             max_customers: 최대 처리 고객 수
-            verbose: 진행 상황 출력
-
         Returns:
-            results: 고객별 설명 결과 리스트
+            results: 고객별 Wake-up 설명 리스트
         """
-        from config import TARGET_COLUMN
-
-        # 추가 발급 거절 고객 필터링
         if TARGET_COLUMN in customer_df.columns:
-            rejected = customer_df[customer_df[TARGET_COLUMN] == 0].copy()
+            target_df = customer_df[customer_df[TARGET_COLUMN] == 1].copy()
         else:
-            rejected = customer_df.copy()
+            target_df = customer_df.copy()
+        target_df = target_df.head(max_customers)
 
-        rejected = rejected.head(max_customers)
-
-        # 분류기로 거절 확률 확인 (이중 확인)
-        X_enc = self.preprocessor.transform(rejected[NUMERICAL_FEATURES + CATEGORICAL_FEATURES])
+        X_enc = self.preprocessor.transform(
+            target_df[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]
+        )
         X_tensor = torch.tensor(X_enc, dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            reject_probs = self.classifier.predict_proba(X_tensor).cpu().numpy()
+            risk_probs = self.classifier.predict_proba(X_tensor).cpu().numpy()
 
         results = []
-        iterator = tqdm(range(len(rejected)), desc="CF 생성 중") if verbose else range(len(rejected))
+        iterator = tqdm(range(len(target_df)), desc="CF 생성 중") if verbose else range(len(target_df))
 
         for i in iterator:
-            row = rejected.iloc[i]
+            row = target_df.iloc[i]
             customer_id = row.get("customer_id", f"고객_{i+1}")
 
-            # 반사실적 후보 생성
             cf_candidates = self.generate_for_customer(
-                row,
-                num_candidates=self.cfg["num_cf_samples"],
+                row, num_candidates=self.cfg["num_cf_samples"]
             )
-
-            # 최적 CF 선택
             best_cf = self.select_best_cf(cf_candidates, row)
 
-            # CF 예측 확률
             x_cf_enc = self.preprocessor.transform(
                 pd.DataFrame([best_cf[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]])
             )
@@ -216,228 +161,250 @@ class TabDiffCFGenerator:
             with torch.no_grad():
                 cf_prob = float(self.classifier.predict_proba(x_cf_tensor).cpu().numpy()[0])
 
-            # 변화된 피처 분석 (Treatment 도출)
+            # CF 유효: inactive_risk=0 (활성) 예측
+            cf_valid = cf_prob < 0.5
+
             treatments = self._extract_treatments(row, best_cf)
 
             results.append({
-                "customer_id": customer_id,
-                "factual": row,
+                "customer_id":   customer_id,
+                "factual":       row,
                 "counterfactual": best_cf,
-                "factual_prob": float(reject_probs[i]),
-                "cf_prob": cf_prob,
-                "cf_valid": cf_prob > 0.5,
-                "treatments": treatments,
-                "num_changes": len(treatments),
+                "factual_prob":  float(risk_probs[i]),   # P(inactive_risk=1)
+                "cf_prob":       cf_prob,                 # P(inactive_risk=1) after CF
+                "cf_valid":      cf_valid,
+                "treatments":    treatments,
+                "num_changes":   len(treatments),
             })
 
         return results
 
-    def _extract_treatments(
-        self,
-        factual: pd.Series,
-        counterfactual: pd.Series,
-    ) -> List[Dict]:
-        """
-        원본과 반사실적의 차이에서 Treatment 권고안 추출
-
-        불변 피처와 미미한 변화는 제외하고
-        실질적인 변화만 Treatment로 제시
-        """
+    def _extract_treatments(self, factual: pd.Series,
+                             counterfactual: pd.Series) -> List[Dict]:
+        """원본 vs CF 비교 → Wake-up Treatment 도출"""
         treatments = []
-        threshold_num = 0.01  # 정규화 공간에서의 최소 변화량
+        threshold_num = 0.03
 
-        # 수치형 피처 비교
         for feat in NUMERICAL_FEATURES:
             if feat in IMMUTABLE_FEATURES:
                 continue
             orig_val = float(factual[feat])
-            cf_val = float(counterfactual[feat])
+            cf_val   = float(counterfactual[feat])
             if abs(cf_val - orig_val) < 1e-6:
                 continue
 
-            # 정규화 공간에서의 변화량 계산
             scaler = self.preprocessor.num_scaler
-            feat_idx = NUMERICAL_FEATURES.index(feat)
-            orig_scaled = (orig_val - scaler.mean_[feat_idx]) / scaler.scale_[feat_idx]
-            cf_scaled = (cf_val - scaler.mean_[feat_idx]) / scaler.scale_[feat_idx]
-            if abs(cf_scaled - orig_scaled) < threshold_num:
+            idx = NUMERICAL_FEATURES.index(feat)
+            orig_s = (orig_val - scaler.mean_[idx]) / scaler.scale_[idx]
+            cf_s   = (cf_val   - scaler.mean_[idx]) / scaler.scale_[idx]
+            if abs(cf_s - orig_s) < threshold_num:
                 continue
 
-            # 변화 방향 검증 (단조 제약 위반 방지)
+            # 단조 제약 위반 제외
             if feat in INCREASING_ONLY_FEATURES and cf_val < orig_val:
                 continue
             if feat in DECREASING_ONLY_FEATURES and cf_val > orig_val:
                 continue
 
             delta = cf_val - orig_val
-            pct_change = (delta / orig_val * 100) if orig_val != 0 else float("inf")
+            pct   = (delta / orig_val * 100) if orig_val != 0 else float("inf")
 
             treatments.append({
-                "feature": feat,
-                "feature_kr": _feat_name_kr(feat),
-                "original": orig_val,
-                "counterfactual": cf_val,
-                "delta": delta,
-                "pct_change": pct_change,
-                "direction": "↑" if delta > 0 else "↓",
-                "type": "numerical",
-                "unit": _feat_unit(feat),
+                "feature":         feat,
+                "feature_kr":      _feat_name_kr(feat),
+                "original":        orig_val,
+                "counterfactual":  cf_val,
+                "delta":           delta,
+                "pct_change":      pct,
+                "direction":       "↑" if delta > 0 else "↓",
+                "type":            "numerical",
+                "unit":            _feat_unit(feat),
             })
 
-        # 범주형 피처 비교
         for feat in CATEGORICAL_FEATURES:
             if feat in IMMUTABLE_FEATURES:
                 continue
             orig_val = str(factual[feat])
-            cf_val = str(counterfactual[feat])
+            cf_val   = str(counterfactual[feat])
             if orig_val == cf_val:
                 continue
-
             treatments.append({
-                "feature": feat,
-                "feature_kr": _feat_name_kr(feat),
-                "original": orig_val,
-                "counterfactual": cf_val,
-                "delta": None,
-                "pct_change": None,
-                "direction": "→",
-                "type": "categorical",
-                "unit": "",
+                "feature":         feat,
+                "feature_kr":      _feat_name_kr(feat),
+                "original":        orig_val,
+                "counterfactual":  cf_val,
+                "delta":           None,
+                "pct_change":      None,
+                "direction":       "→",
+                "type":            "categorical",
+                "unit":            "",
             })
 
-        # 변화량 크기 순 정렬
-        num_treatments = [t for t in treatments if t["type"] == "numerical"]
-        cat_treatments = [t for t in treatments if t["type"] == "categorical"]
-        num_treatments.sort(key=lambda x: abs(x["pct_change"]) if x["pct_change"] else 0, reverse=True)
-
-        return num_treatments + cat_treatments
+        num_t = [t for t in treatments if t["type"] == "numerical"]
+        cat_t = [t for t in treatments if t["type"] == "categorical"]
+        num_t.sort(key=lambda x: abs(x["pct_change"]) if x["pct_change"] else 0, reverse=True)
+        return num_t + cat_t
 
 
-# ─── 한국어 피처명 매핑 ─────────────────────────────────────────────────────────
+# ─── 한국어 피처명·단위 매핑 ────────────────────────────────────────────────────
 
 def _feat_name_kr(feat: str) -> str:
     mapping = {
-        "age": "나이",
-        "annual_income": "연소득",
-        "credit_score": "신용점수",
-        "num_existing_cards": "보유 카드 수",
-        "monthly_spending": "월 카드 사용금액",
-        "years_as_customer": "거래 연수",
-        "total_loan_amount": "총 대출금액",
-        "monthly_transactions": "월 거래 건수",
-        "num_delinquencies": "연체 횟수",
-        "utilization_rate": "신용 한도 사용률",
-        "marital_status": "혼인 상태",
-        "employment_type": "고용 형태",
-        "education_level": "교육 수준",
-        "region": "거주 지역",
+        "months_since_last_txn":      "마지막 거래 경과",
+        "avg_spending_3m":             "최근 3M 월 사용금액",
+        "avg_spending_prev3m":         "이전 3M 월 사용금액",
+        "spending_trend_ratio":        "사용금액 트렌드",
+        "monthly_txn_count_3m":        "최근 3M 월 거래 건수",
+        "num_missed_months":           "무실적 월 수",
+        "days_since_app_login":        "앱 미사용 기간",
+        "loyalty_points_balance":      "미사용 포인트 잔액",
+        "num_active_benefits":         "활성 혜택 수",
+        "years_as_customer":           "거래 연수",
+        "card_tier":                   "카드 등급",
+        "primary_spending_category":   "주요 사용 카테고리",
+        "payment_method":              "결제 수단",
+        "engagement_level":            "디지털 참여도",
     }
     return mapping.get(feat, feat)
 
 
 def _feat_unit(feat: str) -> str:
     units = {
-        "annual_income": "만원",
-        "monthly_spending": "만원",
-        "total_loan_amount": "만원",
-        "credit_score": "점",
-        "utilization_rate": "%",
-        "monthly_transactions": "건",
-        "num_delinquencies": "회",
-        "num_existing_cards": "장",
-        "years_as_customer": "년",
-        "age": "세",
+        "months_since_last_txn":   "개월",
+        "avg_spending_3m":         "만원",
+        "avg_spending_prev3m":     "만원",
+        "spending_trend_ratio":    "배",
+        "monthly_txn_count_3m":    "건",
+        "num_missed_months":       "개월",
+        "days_since_app_login":    "일",
+        "loyalty_points_balance":  "P",
+        "num_active_benefits":     "개",
+        "years_as_customer":       "년",
     }
     return units.get(feat, "")
 
 
-def print_cf_report(result: Dict, show_all_features: bool = False) -> None:
-    """고객별 반사실적 설명 보고서 출력"""
-    cid = result["customer_id"]
-    factual_prob = result["factual_prob"]
-    cf_prob = result["cf_prob"]
-    cf_valid = result["cf_valid"]
-    treatments = result["treatments"]
-
-    print("\n" + "=" * 65)
-    print(f"  고객 ID: {cid}")
-    print("=" * 65)
-    print(f"  현재 예측: {'추가 발급 거절' if factual_prob < 0.5 else '추가 발급 승인'} "
-          f"(확률: {factual_prob*100:.1f}%)")
-    print()
-
-    if treatments:
-        status = "✓ 유효" if cf_valid else "✗ 미달성"
-        print(f"  [반사실적 시나리오 — {status}]")
-        print(f"  목표 예측: 추가 발급 승인 (확률: {cf_prob*100:.1f}%)")
-        print()
-        print(f"  {'피처':<18} {'현재값':>12} {'목표값':>12} {'변화':>15}")
-        print("  " + "─" * 60)
-
-        for t in treatments:
-            feat_kr = t["feature_kr"]
-            unit = t["unit"]
-            orig = t["original"]
-            cf = t["counterfactual"]
-            direction = t["direction"]
-
-            if t["type"] == "numerical":
-                orig_str = f"{orig:,.0f}{unit}" if unit else f"{orig:.2f}"
-                cf_str = f"{cf:,.0f}{unit}" if unit else f"{cf:.2f}"
-                delta = t["delta"]
-                pct = t["pct_change"]
-                change_str = f"{direction}{abs(delta):,.0f} ({abs(pct):.0f}%)"
-            else:
-                orig_str = _translate_cat(t["feature"], str(orig))
-                cf_str = _translate_cat(t["feature"], str(cf))
-                change_str = f"{direction}"
-
-            print(f"  {feat_kr:<18} {orig_str:>12} {cf_str:>12} {change_str:>15}")
-
-        print()
-        print(f"  [마케팅 인사이트]")
-        _print_marketing_insight(treatments)
-    else:
-        print("  [변화 없음] 현재 상태로도 조건 충족 가능")
-
-    print("=" * 65)
-
-
 def _translate_cat(feat: str, val: str) -> str:
-    """범주형 값 한국어 번역"""
     trans = {
-        "marital_status": {"single": "미혼", "married": "기혼", "divorced": "이혼/별거"},
-        "employment_type": {"employed": "재직자", "self_employed": "자영업", "unemployed": "무직", "retired": "퇴직자"},
-        "education_level": {"high_school": "고졸", "college": "대졸", "graduate": "대학원졸"},
-        "region": {"Seoul": "서울", "Gyeonggi": "경기", "Busan": "부산", "Others": "기타"},
+        "card_tier":                 {"The": "The Card", "Black": "Black", "Red": "Red", "Blue": "Blue"},
+        "primary_spending_category": {"dining": "외식", "shopping": "쇼핑", "travel": "여행",
+                                      "convenience": "편의점", "online": "온라인"},
+        "payment_method":            {"app": "앱결제", "online": "온라인결제",
+                                      "offline_nfc": "오프라인NFC", "offline_swipe": "오프라인마그네틱"},
+        "engagement_level":          {"high": "높음", "medium": "보통", "low": "낮음"},
     }
     return trans.get(feat, {}).get(val, val)
 
 
-def _print_marketing_insight(treatments: List[Dict]) -> None:
-    """Treatment 기반 마케팅 액션 권고"""
-    insights = []
+def print_cf_report(result: Dict) -> None:
+    """고객별 Wake-up Counterfactual 보고서 출력"""
+    cid          = result["customer_id"]
+    risk_prob    = result["factual_prob"]      # P(inactive_risk=1) — 원본
+    cf_risk_prob = result["cf_prob"]           # P(inactive_risk=1) — CF 적용 후
+    cf_valid     = result["cf_valid"]
+    treatments   = result["treatments"]
+
+    # 카드 등급·거래 연수 등 참고 정보 추출
+    factual = result["factual"]
+    tier     = factual.get("card_tier", "-")
+    yrs      = factual.get("years_as_customer", 0)
+    missed   = factual.get("num_missed_months", 0)
+    days_app = factual.get("days_since_app_login", 0)
+
+    print("\n" + "=" * 68)
+    print(f"  고객 ID: {cid}  |  카드 등급: {tier}  |  거래 연수: {yrs:.1f}년")
+    print("=" * 68)
+    print(f"  현재 무실적 위험도: {risk_prob*100:.1f}%  "
+          f"(최근 무실적 {int(missed)}개월, 앱 미사용 {int(days_app)}일)")
+    print()
+
+    if not treatments:
+        print("  [변화 없음] 현재 상태로도 활성 전환 가능")
+    else:
+        status = "✓ Wake-up 달성" if cf_valid else "✗ 미달성 (추가 개입 필요)"
+        print(f"  [Wake-up 시나리오 — {status}]")
+        print(f"  목표 달성 시 무실적 위험도: {cf_risk_prob*100:.1f}%  "
+              f"(↓{(risk_prob - cf_risk_prob)*100:.1f}%p 감소)")
+        print()
+        print(f"  {'피처':<22} {'현재값':>13} {'목표값':>13} {'변화':>16}")
+        print("  " + "─" * 66)
+
+        for t in treatments:
+            feat_kr   = t["feature_kr"]
+            unit      = t["unit"]
+            orig      = t["original"]
+            cf        = t["counterfactual"]
+            direction = t["direction"]
+
+            if t["type"] == "numerical":
+                if unit in ("만원", "P"):
+                    orig_str = f"{orig:,.0f}{unit}"
+                    cf_str   = f"{cf:,.0f}{unit}"
+                elif unit in ("배",):
+                    orig_str = f"{orig:.2f}{unit}"
+                    cf_str   = f"{cf:.2f}{unit}"
+                else:
+                    orig_str = f"{orig:.1f}{unit}"
+                    cf_str   = f"{cf:.1f}{unit}"
+                pct = t["pct_change"]
+                delta_abs = abs(t["delta"])
+                if unit in ("만원", "P"):
+                    change_str = f"{direction}{delta_abs:,.0f} ({abs(pct):.0f}%)"
+                elif unit in ("배",):
+                    change_str = f"{direction}{delta_abs:.2f} ({abs(pct):.0f}%)"
+                else:
+                    change_str = f"{direction}{delta_abs:.1f} ({abs(pct):.0f}%)"
+            else:
+                orig_str   = _translate_cat(t["feature"], str(orig))
+                cf_str     = _translate_cat(t["feature"], str(cf))
+                change_str = f"{direction}"
+
+            print(f"  {feat_kr:<22} {orig_str:>13} {cf_str:>13} {change_str:>16}")
+
+        print()
+        print("  [Wake-up 캠페인 액션 권고]")
+        _print_wakeup_actions(treatments, factual)
+
+    print("=" * 68)
+
+
+def _print_wakeup_actions(treatments: List[Dict], factual: pd.Series) -> None:
+    """Treatment 기반 구체적인 Wake-up 캠페인 액션 출력"""
+    actions = []
     for t in treatments:
-        feat = t["feature"]
+        feat      = t["feature"]
         direction = t["direction"]
 
-        if feat == "credit_score" and direction == "↑":
-            insights.append("  → 신용점수 개선 프로그램 안내 (크레딧 빌딩 상품)")
-        elif feat == "monthly_spending" and direction == "↑":
-            insights.append("  → 카드 사용 실적 증가 혜택 캠페인 타겟팅")
-        elif feat == "monthly_transactions" and direction == "↑":
-            insights.append("  → 소액 결제 혜택(포인트/캐시백) 강화 마케팅")
-        elif feat == "annual_income" and direction == "↑":
-            insights.append("  → 소득 증가 시 자동 한도 상향 안내")
-        elif feat == "num_delinquencies" and direction == "↓":
-            insights.append("  → 연체 관리 지원 서비스 안내 (납기일 알림 등)")
-        elif feat == "utilization_rate" and direction == "↓":
-            insights.append("  → 신용 한도 사용률 낮추기 가이드 제공")
-        elif feat == "employment_type":
-            insights.append("  → 고용 상태 변화 시 재심사 안내")
+        if feat == "days_since_app_login" and direction == "↓":
+            days = factual.get("days_since_app_login", 0)
+            actions.append(f"  → [앱 재참여] 푸시 알림 발송 / {int(days)}일 미접속 특별 혜택 안내")
+        elif feat == "avg_spending_3m" and direction == "↑":
+            actions.append("  → [사용 실적] 월 사용금액 목표 달성 시 캐시백/포인트 추가 적립 캠페인")
+        elif feat == "monthly_txn_count_3m" and direction == "↑":
+            actions.append("  → [결제 빈도] 소액 결제 N건당 포인트 지급 미션 이벤트")
+        elif feat == "num_missed_months" and direction == "↓":
+            actions.append("  → [연속 사용] 연속 이용 개월 수에 따른 보너스 포인트 리워드")
+        elif feat == "num_active_benefits" and direction == "↑":
+            pnt = factual.get("loyalty_points_balance", 0)
+            actions.append(f"  → [혜택 등록] 미가입 서비스 안내 / 포인트 {int(pnt):,}P 활용 혜택 추천")
+        elif feat == "loyalty_points_balance" and direction == "↓":
+            actions.append("  → [포인트 소진] 포인트 만료 예정 알림 / 포인트 사용처 추천")
+        elif feat == "spending_trend_ratio" and direction == "↑":
+            actions.append("  → [트렌드 반전] 전월 대비 사용 증가 시 보너스 혜택 제공")
+        elif feat == "engagement_level":
+            cf_val = t["counterfactual"]
+            actions.append(f"  → [디지털 참여] 앱 전용 이벤트 / 간편결제 전환 유도 ({cf_val} 수준 목표)")
+        elif feat == "payment_method":
+            cf_val = _translate_cat("payment_method", str(t["counterfactual"]))
+            actions.append(f"  → [결제 수단] {cf_val} 전환 시 추가 적립 혜택 안내")
+        elif feat == "primary_spending_category":
+            cf_val = _translate_cat("primary_spending_category", str(t["counterfactual"]))
+            actions.append(f"  → [카테고리 확장] {cf_val} 카테고리 특별 할인/포인트 캠페인")
 
-    if insights:
-        for ins in insights[:3]:  # 상위 3개만
-            print(ins)
-    else:
-        print("  → 현재 프로필 기반 맞춤형 카드 혜택 안내 권고")
+    seen = set()
+    for a in actions:
+        if a not in seen:
+            print(a)
+            seen.add(a)
+        if len(seen) >= 3:
+            break

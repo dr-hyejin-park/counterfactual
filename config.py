@@ -1,7 +1,12 @@
 """
-현대카드 추가 발급 Counterfactual Explanation 시스템 설정
-TabDiff 기반 반사실적 설명 생성 (논문: Tabular Diffusion Based Actionable
-Counterfactual Explanations for Network Intrusion Detection 응용)
+현대카드 무실적 위험 고객 Wake-up 캠페인
+TabDiff 기반 반사실적 설명 시스템 설정
+
+[Use Case 변경]
+추가 카드 발급 유도 → 무실적 위험 고객 활성화(Wake-up)
+- 대상: 무실적 위험으로 예측된 고객 (inactive_risk = 1)
+- 목표: 최소한의 행동 변화로 활성 고객(inactive_risk = 0) 상태로 전환
+- 출력: 고객별 맞춤형 Wake-up Treatment 권고안
 """
 
 # ─── 데이터 설정 ────────────────────────────────────────────────────────────────
@@ -13,80 +18,80 @@ DATA_CONFIG = {
 }
 
 # ─── 피처 정의 ──────────────────────────────────────────────────────────────────
-# 수치형 피처 (연속)
+# 수치형 피처 (연속) — 행동/거래 패턴 중심
 NUMERICAL_FEATURES = [
-    "age",                    # 나이 (세)
-    "annual_income",          # 연소득 (만원)
-    "credit_score",           # 신용점수 (300~900)
-    "num_existing_cards",     # 보유 카드 수
-    "monthly_spending",       # 월 카드 사용금액 (만원)
-    "years_as_customer",      # 현대카드 거래 연수
-    "total_loan_amount",      # 총 대출금액 (만원)
-    "monthly_transactions",   # 월 거래 건수
-    "num_delinquencies",      # 연체 횟수
-    "utilization_rate",       # 신용 한도 사용률 (%)
+    "months_since_last_txn",      # 마지막 거래 경과 월 수 (높을수록 위험)
+    "avg_spending_3m",             # 최근 3개월 평균 월 사용금액 (만원)
+    "avg_spending_prev3m",         # 이전 3-6개월 평균 월 사용금액 (만원)
+    "spending_trend_ratio",        # 사용금액 트렌드 (최근3m/이전3m, 1 미만 = 감소)
+    "monthly_txn_count_3m",        # 최근 3개월 평균 월 거래 건수
+    "num_missed_months",           # 최근 6개월 중 무실적(사용금액=0) 월 수
+    "days_since_app_login",        # 앱 마지막 로그인 경과 일수
+    "loyalty_points_balance",      # 미사용 포인트 잔액 (포인트)
+    "num_active_benefits",         # 현재 활성 카드 혜택/서비스 수
+    "years_as_customer",           # 현대카드 거래 연수
 ]
 
 # 범주형 피처
 CATEGORICAL_FEATURES = [
-    "marital_status",         # 혼인 상태
-    "employment_type",        # 고용 형태
-    "education_level",        # 교육 수준
-    "region",                 # 거주 지역
+    "card_tier",                   # 카드 등급 (The, Black, Red, Blue)
+    "primary_spending_category",   # 주요 사용 카테고리
+    "payment_method",              # 주요 결제 수단
+    "engagement_level",            # 디지털/앱 참여도
 ]
 
 # 범주형 피처 값 목록
 CATEGORICAL_VALUES = {
-    "marital_status":   ["single", "married", "divorced"],
-    "employment_type":  ["employed", "self_employed", "unemployed", "retired"],
-    "education_level":  ["high_school", "college", "graduate"],
-    "region":           ["Seoul", "Gyeonggi", "Busan", "Others"],
+    "card_tier":                ["The", "Black", "Red", "Blue"],
+    "primary_spending_category": ["dining", "shopping", "travel", "convenience", "online"],
+    "payment_method":           ["app", "online", "offline_nfc", "offline_swipe"],
+    "engagement_level":         ["high", "medium", "low"],
 }
 
 # 타겟 컬럼
-TARGET_COLUMN = "additional_card"   # 1 = 추가 발급 동의/자격, 0 = 미동의/미자격
+TARGET_COLUMN = "inactive_risk"   # 1 = 무실적 위험, 0 = 활성 고객
 
 # 전체 피처 목록 (순서 고정)
 ALL_FEATURES = NUMERICAL_FEATURES + CATEGORICAL_FEATURES
 
 # ─── 행동 가능성 제약 (Actionability Constraints) ───────────────────────────────
-# 반사실적 생성 시 변경 불가 혹은 방향이 제한된 피처
+# Wake-up 캠페인 맥락: 마케팅 액션으로 실제로 변화시킬 수 있는 피처만 허용
+
+# 변경 불가 피처 (인구통계/기본 계약 조건)
 IMMUTABLE_FEATURES = [
-    "age",
-    "marital_status",
-    "region",
-    "education_level",
-    "years_as_customer",   # 시간 기반 — 자연 증가
-    "total_loan_amount",   # 마케팅 액션으로 직접 변경 불가
+    "years_as_customer",           # 시간 기반 — 자연 변화
+    "avg_spending_prev3m",         # 과거 실적 — 소급 변경 불가
+    "card_tier",                   # 카드 등급 — 발급 조건에 의해 결정
 ]
 
-# 값이 증가만 가능한 피처 (현실적으로 줄이기 어려운 항목)
-INCREASING_ONLY_FEATURES = [
-    "annual_income",
-    "credit_score",
-    "monthly_spending",
-    "monthly_transactions",
-]
-
-# 값이 감소만 가능한 피처
+# 값이 감소해야 하는 피처 (줄일수록 활성 상태 유지)
 DECREASING_ONLY_FEATURES = [
-    "num_delinquencies",
-    "utilization_rate",
+    "months_since_last_txn",       # 최근 거래 늘어야 → 경과 월 감소
+    "days_since_app_login",        # 앱 재방문 유도 → 경과 일수 감소
+    "num_missed_months",           # 무실적 월 감소
+]
+
+# 값이 증가해야 하는 피처 (늘어날수록 활성 상태 유지)
+INCREASING_ONLY_FEATURES = [
+    "avg_spending_3m",             # 월 사용금액 증가
+    "monthly_txn_count_3m",        # 월 거래 건수 증가
+    "spending_trend_ratio",        # 사용 트렌드 개선
+    "num_active_benefits",         # 혜택 가입 수 증가
 ]
 
 # ─── TabDiff 모델 설정 ──────────────────────────────────────────────────────────
 TABDIFF_CONFIG = {
-    "num_timesteps": 1000,       # 전체 확산 스텝 수
-    "beta_start": 1e-4,          # 노이즈 스케줄 시작값
-    "beta_end": 2e-2,            # 노이즈 스케줄 종료값
-    "hidden_dim": 256,           # Transformer 숨겨진 차원
-    "num_heads": 8,              # Multi-head Attention 헤드 수
-    "num_layers": 6,             # Transformer 레이어 수
+    "num_timesteps": 1000,
+    "beta_start": 1e-4,
+    "beta_end": 2e-2,
+    "hidden_dim": 256,
+    "num_heads": 8,
+    "num_layers": 6,
     "dropout": 0.1,
     "learning_rate": 1e-3,
     "batch_size": 256,
     "num_epochs": 100,
-    "device": "cpu",             # GPU 없는 환경 대비 cpu 기본
+    "device": "cpu",
 }
 
 # ─── 분류기 설정 ────────────────────────────────────────────────────────────────
@@ -104,7 +109,7 @@ CF_CONFIG = {
     "num_cf_timesteps": 300,     # 반사실적 생성에 사용할 확산 스텝 수 (T_cf)
     "guidance_scale": 3.0,       # 분류기 guidance 강도 λ
     "num_cf_samples": 5,         # 고객당 생성할 후보 CF 수
-    "target_class": 1,           # 목표 클래스 (1 = 추가 발급 승인)
-    "proximity_weight": 0.5,     # 원본 데이터와의 근접도 가중치
-    "max_change_ratio": 0.5,     # 피처당 최대 변화 비율 (원본 대비)
+    "target_class": 0,           # 목표 클래스 (0 = 활성 고객, 무실적 위험 해제)
+    "proximity_weight": 0.5,
+    "max_change_ratio": 0.5,
 }

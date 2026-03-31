@@ -105,18 +105,37 @@ class HyundaiCardPreprocessor:
             values = self.cat_encoders[feat]
             cat_rows[feat] = [values[idx] for idx in indices]
 
-        # 원래 스케일로 클리핑
+        # 수치형 피처별 클리핑 규칙 (피처명 → (반올림 소수점, 최소, 최대, int 변환))
+        clip_rules = {
+            # ── 무실적 위험 피처 ──
+            "months_since_last_txn":    (1,   0,    12,    False),
+            "avg_spending_3m":          (0,   0,  5000,    False),
+            "avg_spending_prev3m":      (0,   0,  5000,    False),
+            "spending_trend_ratio":     (3,   0,     3,    False),
+            "monthly_txn_count_3m":     (0,   0,   200,    True),
+            "num_missed_months":        (0,   0,     6,    True),
+            "days_since_app_login":     (0,   0,   365,    True),
+            "loyalty_points_balance":   (0,   0, 300000,   False),
+            "num_active_benefits":      (0,   0,    20,    True),
+            "years_as_customer":        (1,   0,    30,    False),
+            # ── 추가 발급 피처 (이전 버전 호환) ──
+            "age":                      (0,  18,    80,    True),
+            "annual_income":            (0, 500, 30000,    False),
+            "credit_score":             (0, 300,   900,    False),
+            "num_existing_cards":       (0,   0,    10,    True),
+            "monthly_spending":         (0,   0,  5000,    False),
+            "total_loan_amount":        (0,   0, 100000,   False),
+            "monthly_transactions":     (0,   0,   200,    True),
+            "num_delinquencies":        (0,   0,    10,    True),
+            "utilization_rate":         (1,   0,   200,    False),
+        }
         num_df = pd.DataFrame(num_raw, columns=NUMERICAL_FEATURES)
-        num_df["age"] = num_df["age"].round(0).clip(18, 80).astype(int)
-        num_df["annual_income"] = num_df["annual_income"].round(0).clip(500, 30000)
-        num_df["credit_score"] = num_df["credit_score"].round(0).clip(300, 900)
-        num_df["num_existing_cards"] = num_df["num_existing_cards"].round(0).clip(0, 10).astype(int)
-        num_df["monthly_spending"] = num_df["monthly_spending"].round(0).clip(0, 5000)
-        num_df["years_as_customer"] = num_df["years_as_customer"].round(1).clip(0, 30)
-        num_df["total_loan_amount"] = num_df["total_loan_amount"].round(0).clip(0, 100000)
-        num_df["monthly_transactions"] = num_df["monthly_transactions"].round(0).clip(0, 200).astype(int)
-        num_df["num_delinquencies"] = num_df["num_delinquencies"].round(0).clip(0, 10).astype(int)
-        num_df["utilization_rate"] = num_df["utilization_rate"].round(1).clip(0, 200)
+        for col in NUMERICAL_FEATURES:
+            if col in clip_rules:
+                dec, lo, hi, to_int = clip_rules[col]
+                num_df[col] = num_df[col].round(dec).clip(lo, hi)
+                if to_int:
+                    num_df[col] = num_df[col].astype(int)
 
         cat_df = pd.DataFrame(cat_rows)
         return pd.concat([num_df, cat_df], axis=1)

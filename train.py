@@ -1,5 +1,5 @@
 """
-TabDiff 모델 및 분류기 학습 스크립트
+현대카드 무실적 위험 고객 Wake-up — TabDiff 모델 및 분류기 학습 스크립트
 
 실행:
   python train.py [--epochs_tabdiff N] [--epochs_clf N] [--quick]
@@ -240,7 +240,7 @@ def main():
     print("\n" + "=" * 60)
     print("학습 완료!")
     print(f"  체크포인트 디렉토리: {args.output_dir}/")
-    print("  다음 단계: python run_demo.py")
+    print("  다음 단계: python run_demo.py --n_customers 10")
     print("=" * 60)
 
 
