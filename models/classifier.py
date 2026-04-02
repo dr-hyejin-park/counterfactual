@@ -31,6 +31,7 @@ class CardIssuanceClassifier(nn.Module):
     ):
         super().__init__()
         self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
 
         layers = []
         prev_dim = input_dim
@@ -124,6 +125,17 @@ class ClassifierTrainer:
         batch_size: int = 256,
         verbose: bool = True,
     ) -> None:
+        # 입력 차원 사전 검증 — 불일치 시 명확한 오류 메시지 제공
+        actual_dim = X_train.shape[1]
+        expected_dim = self.model.input_dim
+        if actual_dim != expected_dim:
+            raise ValueError(
+                f"입력 차원 불일치: 학습 데이터는 {actual_dim}차원이지만 "
+                f"모델은 {expected_dim}차원을 기대합니다.\n"
+                f"  원인: config.py의 피처 정의와 맞지 않는 기존 체크포인트가 "
+                f"checkpoints/ 폴더에 남아 있을 수 있습니다.\n"
+                f"  해결: checkpoints/ 폴더를 삭제하고 train.py를 다시 실행하세요."
+            )
         train_ds = TensorDataset(
             torch.tensor(X_train, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32),
@@ -166,6 +178,7 @@ class ClassifierTrainer:
         torch.save({
             "model_state": self.model.state_dict(),
             "input_dim": self.model.input_dim,
+            "hidden_dims": self.model.hidden_dims,
             "train_losses": self.train_losses,
             "val_losses": self.val_losses,
             "val_accs": self.val_accs,
@@ -174,7 +187,11 @@ class ClassifierTrainer:
     @staticmethod
     def load(path: str, device: str = "cpu") -> "CardIssuanceClassifier":
         ckpt = torch.load(path, map_location=device)
-        model = CardIssuanceClassifier(input_dim=ckpt["input_dim"])
+        hidden_dims = tuple(ckpt.get("hidden_dims", (128, 64, 32)))
+        model = CardIssuanceClassifier(
+            input_dim=ckpt["input_dim"],
+            hidden_dims=hidden_dims,
+        )
         model.load_state_dict(ckpt["model_state"])
         model.to(device)
         model.eval()
