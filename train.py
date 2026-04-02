@@ -27,7 +27,7 @@ from config import (
 from data.hyundai_card_data import generate_hyundai_card_data, print_data_summary
 from utils.preprocessing import HyundaiCardPreprocessor, split_features_target
 from models.tabdiff import TabDiff
-from models.classifier import CardIssuanceClassifier, ClassifierTrainer
+from models.classifier import InactiveRiskClassifier, ClassifierTrainer
 
 
 def parse_args():
@@ -167,10 +167,10 @@ def main():
 
     # ── 3. 분류기 학습 ────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("3단계: 추가 발급 예측 분류기 학습")
+    print("3단계: 무실적 위험 예측 분류기 학습")
     print("=" * 60)
 
-    clf_model = CardIssuanceClassifier(
+    clf_model = InactiveRiskClassifier(
         input_dim=preprocessor.total_dim,
         hidden_dims=tuple(CLASSIFIER_CONFIG["hidden_dims"]),
         dropout=CLASSIFIER_CONFIG["dropout"],

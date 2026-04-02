@@ -1,8 +1,8 @@
 """
-추가 카드 발급 예측 분류기
+무실적 위험 예측 분류기
 - 신경망 기반 (gradient 계산 가능 → classifier guidance에 활용)
-- 학습 데이터: 전처리된 현대카드 고객 데이터
-- 출력: P(추가 발급 = 1 | 고객 특성)
+- 학습 데이터: 전처리된 현대카드 고객 행동 데이터
+- 출력: P(무실적 위험 = 1 | 고객 특성)
 """
 
 import numpy as np
@@ -14,13 +14,13 @@ from typing import Tuple, Optional
 import os
 
 
-class CardIssuanceClassifier(nn.Module):
+class InactiveRiskClassifier(nn.Module):
     """
-    추가 카드 발급 예측 신경망 분류기
+    무실적 위험 예측 신경망 분류기
 
     TabDiff counterfactual guidance에서 사용:
-    guidance_fn(x_t) = log σ(classifier(x_t))
-    → 분류기 gradient가 역확산 방향을 클래스 1로 유도
+    guidance_fn(x_t) = log σ(-classifier(x_t))
+    → 분류기 gradient가 역확산 방향을 무실적 위험 0(활성) 클래스로 유도
     """
 
     def __init__(
@@ -52,15 +52,20 @@ class CardIssuanceClassifier(nn.Module):
         return self.network(x).squeeze(-1)
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """추가 발급 확률 P(y=1|x) 반환"""
+        """무실적 위험 확률 P(inactive_risk=1|x) 반환"""
         return torch.sigmoid(self.forward(x))
 
     def log_prob_target(self, x: torch.Tensor) -> torch.Tensor:
         """
-        log P(y=1|x) 반환 — classifier guidance에서 사용
-        수식: log σ(f(x))
+        log P(inactive_risk=0|x) 반환 — classifier guidance에서 사용
+        counterfactual 목표 클래스(0=활성)로 유도하기 위해 logit 부호 반전
+        수식: log σ(-f(x))
         """
-        return F.logsigmoid(self.forward(x))
+        return F.logsigmoid(-self.forward(x))
+
+
+# 하위 호환성 별칭 (기존 체크포인트 로드 시 사용)
+CardIssuanceClassifier = InactiveRiskClassifier
 
 
 class ClassifierTrainer:
@@ -68,7 +73,7 @@ class ClassifierTrainer:
 
     def __init__(
         self,
-        model: CardIssuanceClassifier,
+        model: InactiveRiskClassifier,
         lr: float = 1e-3,
         device: str = "cpu",
     ):
@@ -185,10 +190,10 @@ class ClassifierTrainer:
         }, path)
 
     @staticmethod
-    def load(path: str, device: str = "cpu") -> "CardIssuanceClassifier":
+    def load(path: str, device: str = "cpu") -> "InactiveRiskClassifier":
         ckpt = torch.load(path, map_location=device)
         hidden_dims = tuple(ckpt.get("hidden_dims", (128, 64, 32)))
-        model = CardIssuanceClassifier(
+        model = InactiveRiskClassifier(
             input_dim=ckpt["input_dim"],
             hidden_dims=hidden_dims,
         )

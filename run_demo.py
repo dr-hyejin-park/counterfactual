@@ -32,7 +32,7 @@ from config import (
 )
 from utils.preprocessing import HyundaiCardPreprocessor
 from models.tabdiff import TabDiff
-from models.classifier import CardIssuanceClassifier
+from models.classifier import InactiveRiskClassifier
 from cf_engine.generator import TabDiffCFGenerator, print_cf_report, _translate_cat, _feat_name_kr
 from cf_engine.constraints import compute_proximity, compute_sparsity
 
@@ -54,7 +54,11 @@ def load_models(checkpoint_dir: str, device: str):
     print(f"  전처리기 로드 완료 (입력 차원: {preprocessor.total_dim})")
 
     clf_ckpt   = torch.load(f"{checkpoint_dir}/classifier.pt",  map_location=device)
-    classifier = CardIssuanceClassifier(input_dim=clf_ckpt["input_dim"])
+    hidden_dims = tuple(clf_ckpt.get("hidden_dims", (128, 64, 32)))
+    classifier = InactiveRiskClassifier(
+        input_dim=clf_ckpt["input_dim"],
+        hidden_dims=hidden_dims,
+    )
     classifier.load_state_dict(clf_ckpt["model_state"])
     classifier.to(device).eval()
     print("  분류기 로드 완료")

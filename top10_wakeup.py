@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import NUMERICAL_FEATURES, CATEGORICAL_FEATURES, TARGET_COLUMN, CF_CONFIG, TABDIFF_CONFIG
 from utils.preprocessing import HyundaiCardPreprocessor
 from models.tabdiff import TabDiff
-from models.classifier import CardIssuanceClassifier
+from models.classifier import InactiveRiskClassifier
 from cf_engine.generator import (
     TabDiffCFGenerator, print_cf_report, build_treatment_rows, build_action_rows,
     _feat_name_kr, _feat_unit, _translate_cat,
@@ -117,7 +117,11 @@ def parse_args():
 def load_models(ckpt_dir: str, device: str):
     preprocessor = HyundaiCardPreprocessor.load(f"{ckpt_dir}/preprocessor.pkl")
     clf_ckpt   = torch.load(f"{ckpt_dir}/classifier.pt",  map_location=device)
-    classifier = CardIssuanceClassifier(input_dim=clf_ckpt["input_dim"])
+    hidden_dims = tuple(clf_ckpt.get("hidden_dims", (128, 64, 32)))
+    classifier = InactiveRiskClassifier(
+        input_dim=clf_ckpt["input_dim"],
+        hidden_dims=hidden_dims,
+    )
     classifier.load_state_dict(clf_ckpt["model_state"])
     classifier.to(device).eval()
     td_ckpt = torch.load(f"{ckpt_dir}/tabdiff.pt", map_location=device)
