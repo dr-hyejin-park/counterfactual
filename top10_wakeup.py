@@ -99,11 +99,15 @@ def parse_args():
                    help="CF 배치 크기 (None=자동 추천)")
     p.add_argument("--num_candidates",   type=int,   default=2,
                    help="고객당 CF 후보 수 (대규모 시 2 권장)")
-    # CF timestep
+    # CF timestep / guidance
     p.add_argument("--fast",             action="store_true",
                    help="빠른 CF: timestep=100")
     p.add_argument("--cf_timesteps",     type=int,   default=None,
-                   help="CF 역확산 스텝 수 (None → fast:100, 일반:200)")
+                   help="CF 역확산 스텝 수 (None → fast:100, 일반 400)")
+    p.add_argument("--guidance_scale",   type=float, default=None,
+                   help="Guidance 강도 λ (None → config 기본값 8.0, 적응형 자동 조정)")
+    p.add_argument("--refine_steps",     type=int,   default=None,
+                   help="Diffusion 후 gradient 정제 횟수 (None → config 기본값 10)")
     # 출력
     p.add_argument("--output_format",    default="csv", choices=["csv", "parquet"])
     p.add_argument("--resume",           action="store_true",
@@ -408,9 +412,12 @@ def main():
         cf_cfg["num_cf_timesteps"] = args.cf_timesteps
     elif args.fast:
         cf_cfg["num_cf_timesteps"] = 100
-    else:
-        cf_cfg["num_cf_timesteps"] = 200
+    # 기본값은 CF_CONFIG의 400 사용 (args.cf_timesteps=None, args.fast=False)
     cf_cfg["num_cf_samples"] = args.num_candidates
+    if args.guidance_scale is not None:
+        cf_cfg["guidance_scale"] = args.guidance_scale
+    if args.refine_steps is not None:
+        cf_cfg["refine_steps"] = args.refine_steps
 
     batch_size = args.batch_size or recommend_batch_size(
         device, preprocessor.total_dim, cf_cfg["num_cf_timesteps"]

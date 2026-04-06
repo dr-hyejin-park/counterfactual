@@ -54,15 +54,38 @@ class TabDiffCFGenerator:
         self.cfg = cf_config or CF_CONFIG
         self.constraints = ActionabilityConstraints(preprocessor)
 
-    def _guidance_fn(self, x_t: torch.Tensor) -> torch.Tensor:
+    def _guidance_fn(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Classifier guidance: log P(y=0 | x_t) = log(1 - σ(f(x_t)))
-        목표 클래스 0(활성 고객) 방향으로 역확산 유도
+        Classifier guidance: log P(y=0 | x)
+        목표 클래스 0(활성 고객) 방향으로 역확산 유도.
+        x₀-prediction 방식으로 변경되어 clean space의 x₀_pred를 입력받음.
         """
         import torch.nn.functional as F
-        logit = self.classifier(x_t)          # (batch,)
-        # log P(y=0|x) = log(1 - sigmoid(logit)) = log sigmoid(-logit)
+        logit = self.classifier(x)
         return F.logsigmoid(-logit)
+
+    def _adaptive_guidance_scale(self, factual_probs: np.ndarray) -> float:
+        """
+        위험도에 따른 적응형 guidance scale.
+
+        무실적 위험도가 높을수록 분류기 경계에서 더 멀리 있으므로
+        더 강한 guidance가 필요합니다.
+
+          risk < 0.6  → scale * 0.7  (경계 근처, 약한 guidance로 충분)
+          0.6 ~ 0.75  → scale * 1.0  (기본값)
+          0.75 ~ 0.85 → scale * 1.5  (고위험, 중간 강도)
+          risk >= 0.85 → scale * 2.5  (초고위험, 강한 guidance 필요)
+        """
+        avg_risk = float(np.mean(factual_probs))
+        base     = self.cfg["guidance_scale"]
+        if avg_risk < 0.60:
+            return base * 0.7
+        elif avg_risk < 0.75:
+            return base * 1.0
+        elif avg_risk < 0.85:
+            return base * 1.5
+        else:
+            return base * 2.5
 
     def generate_for_customer(self, customer_row: pd.Series,
                                num_candidates: int = 5) -> pd.DataFrame:
@@ -108,6 +131,12 @@ class TabDiffCFGenerator:
             customer_df[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]
         )  # (n, dim)
 
+        # 고객별 위험도 기반 적응형 guidance scale 결정
+        x_factual_t_score = torch.tensor(x_factual_np, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            factual_probs = self.classifier.predict_proba(x_factual_t_score).cpu().numpy()
+        adaptive_scale = self._adaptive_guidance_scale(factual_probs)
+
         # 각 고객을 num_candidates번 복제 → [c1,c1, c2,c2, ...] 순서
         x_factual_repeated = np.repeat(x_factual_np, num_candidates, axis=0)  # (n*k, dim)
         x_factual_t = torch.tensor(x_factual_repeated, dtype=torch.float32, device=self.device)
@@ -117,8 +146,10 @@ class TabDiffCFGenerator:
             x_factual=x_factual_t,
             t_start=self.cfg["num_cf_timesteps"],
             guidance_fn=self._guidance_fn,
-            guidance_scale=self.cfg["guidance_scale"],
+            guidance_scale=adaptive_scale,
             constraint_fn=lambda xc, xf: self.constraints.apply(xc, xf),
+            refine_steps=self.cfg.get("refine_steps", 0),
+            refine_lr=self.cfg.get("refine_lr", 0.05),
         )  # (n*k, dim)
 
         x_cf_np = x_cf_all.cpu().numpy()

@@ -53,8 +53,9 @@ def score_in_chunks(
     processed_ids: set = set()
 
     if resume and checkpoint_path and os.path.exists(checkpoint_path):
-        done_df = pd.read_csv(checkpoint_path, usecols=["customer_id"])
+        done_df = pd.read_csv(checkpoint_path)          # 전체 컬럼 로드
         processed_ids = set(done_df["customer_id"].values)
+        all_results.append(done_df)                     # ← 기존 결과를 최종 병합에 포함
         print(f"  체크포인트 발견: {len(processed_ids):,}명 이미 처리됨 — 이어서 시작")
 
     ckpt_file = open(checkpoint_path, "a") if checkpoint_path else None

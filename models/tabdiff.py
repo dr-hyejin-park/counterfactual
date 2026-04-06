@@ -258,42 +258,55 @@ class TabDiff(nn.Module):
         guidance_scale: float,
     ) -> torch.Tensor:
         """
-        Classifier guidance를 포함한 역확산 스텝
-        논문의 핵심: 분류기 gradient로 counterfactual 방향 유도
+        x₀-prediction classifier guidance를 포함한 역확산 스텝
 
-        수식: ε̃ = ε_θ(x_t, t) - sqrt(1 - α̅_t) * ∇_{x_t} log p_φ(y=1 | x_t)
+        [기존 방식의 문제]
+        분류기는 깨끗한 x₀로 학습됐지만, 기존 방식은 노이즈가 낀 x_t에서
+        gradient를 계산 → 분류기가 out-of-distribution 입력을 받아 신호 매우 약함
+
+        [개선: x₀-prediction guidance]
+        1. ε_θ(x_t, t)로 깨끗한 x₀_pred를 먼저 복원
+        2. 분류기 훈련 분포(x₀)에서 gradient 계산: ∇_{x₀} log p(y|x₀_pred)
+        3. chain rule로 x_t 공간으로 역전파: grad_xt = grad_x0 / √ᾱ_t
+
+        수식: ε̃ = ε_θ(x_t,t) - guidance_scale * √(1-ᾱ_t)/√ᾱ_t * ∇_{x₀} log p(y|x₀_pred)
         """
         t_tensor = torch.full((x_t.shape[0],), t, device=x_t.device, dtype=torch.long)
+        x_t_d = x_t.detach()
 
-        # gradient 계산을 위해 requires_grad=True
-        x_t_guided = x_t.detach().requires_grad_(True)
+        # ── 1단계: denoiser로 eps 예측 (no_grad) ────────────────────────────
+        with torch.no_grad():
+            eps_pred = self.denoiser(x_t_d, t_tensor)
 
-        # 노이즈 예측 (gradient 추적)
-        eps_pred = self.denoiser(x_t_guided, t_tensor)
+        sqrt_a    = self.sqrt_alphas_cumprod[t]           # √ᾱ_t
+        sqrt_1ma  = self.sqrt_one_minus_alphas_cumprod[t]  # √(1-ᾱ_t)
 
-        # Classifier guidance: ∇_{x_t} log p(y=1|x_t)
-        log_prob = guidance_fn(x_t_guided)  # (batch,) — log p(y=1|x_t)
-        grad = torch.autograd.grad(log_prob.sum(), x_t_guided)[0]
+        # ── 2단계: x₀_pred 복원 (clean space) ───────────────────────────────
+        # x₀_pred = (x_t - √(1-ᾱ_t)·ε) / √ᾱ_t
+        x_0_pred = (x_t_d - sqrt_1ma * eps_pred) / sqrt_a
 
-        # guidance가 적용된 노이즈 예측
-        sqrt_1ma = self.sqrt_one_minus_alphas_cumprod[t]
-        eps_guided = eps_pred - guidance_scale * sqrt_1ma * grad
+        # ── 3단계: 분류기 훈련 분포(x₀)에서 gradient 계산 ───────────────────
+        x_0_guided = x_0_pred.detach().requires_grad_(True)
+        log_prob   = guidance_fn(x_0_guided)              # log p(y=target | x₀_pred)
+        grad_x0    = torch.autograd.grad(log_prob.sum(), x_0_guided)[0]
 
-        # eps_guided로 x_0 재추정
-        x_t_no_grad = x_t.detach()
-        sqrt_recip_a = self.sqrt_alphas_cumprod[t] ** (-1)
-        x_0_pred = sqrt_recip_a * (x_t_no_grad - sqrt_1ma * eps_guided.detach())
+        # ── 4단계: chain rule로 x_t 공간의 eps 보정 ─────────────────────────
+        # ∂x₀_pred/∂x_t = 1/√ᾱ_t  →  grad_xt = grad_x0 / √ᾱ_t
+        # eps 보정: ε̃ = ε - scale * √(1-ᾱ_t) * (grad_x0 / √ᾱ_t)
+        grad_xt   = grad_x0.detach() / sqrt_a
+        eps_guided = eps_pred - guidance_scale * sqrt_1ma * grad_xt
 
-        # posterior mean 계산
+        # ── 5단계: eps_guided로 x₀ 재추정 → posterior mean ──────────────────
+        x_0_guided_final = (x_t_d - sqrt_1ma * eps_guided) / sqrt_a
+
         beta_t = self.betas[t]
-        coef1 = beta_t * self.alphas_cumprod_prev[t] ** 0.5 / (1.0 - self.alphas_cumprod[t])
-        coef2 = (1.0 - self.alphas_cumprod_prev[t]) * self.alphas[t] ** 0.5 / (1.0 - self.alphas_cumprod[t])
-        mean = coef1 * x_0_pred + coef2 * x_t_no_grad
+        coef1  = beta_t * self.alphas_cumprod_prev[t] ** 0.5 / (1.0 - self.alphas_cumprod[t])
+        coef2  = (1.0 - self.alphas_cumprod_prev[t]) * self.alphas[t] ** 0.5 / (1.0 - self.alphas_cumprod[t])
+        mean   = coef1 * x_0_guided_final + coef2 * x_t_d
 
         if t > 0:
-            var = self.posterior_variance[t]
-            noise = torch.randn_like(x_t_no_grad)
-            x_prev = mean + var ** 0.5 * noise
+            noise  = torch.randn_like(x_t_d)
+            x_prev = mean + self.posterior_variance[t] ** 0.5 * noise
         else:
             x_prev = mean
 
@@ -326,30 +339,66 @@ class TabDiff(nn.Module):
         guidance_fn,
         guidance_scale: float,
         constraint_fn=None,
+        refine_steps: int = 0,
+        refine_lr: float = 0.05,
     ) -> torch.Tensor:
         """
-        반사실적 생성 역확산 루프
-        1. x_factual → x_{t_start} (부분 노이즈)
-        2. t_start → 0 역확산 + classifier guidance
-        3. 각 스텝마다 행동 가능성 제약 적용
+        반사실적 생성 역확산 루프 (x₀-prediction guidance + 후처리 정제)
 
         Args:
             x_factual:      원본 고객 데이터 (인코딩됨)
             t_start:        역확산 시작 timestep (T_cf)
-            guidance_fn:    log p(y=1|x_t) 반환하는 함수
+            guidance_fn:    log p(y=target|x₀) 반환하는 함수
             guidance_scale: guidance 강도 λ
             constraint_fn:  제약 함수 (optional)
+            refine_steps:   diffusion 후 gradient ascent 정제 횟수 (0=생략)
+            refine_lr:      정제 스텝 학습률
         Returns:
             x_cf: 반사실적 데이터
         """
-        # 부분 노이즈 추가
         x_t = self.partial_noise(x_factual, t_start)
 
         for t in reversed(range(t_start)):
             x_t = self.p_sample_with_guidance(x_t, t, guidance_fn, guidance_scale)
-
-            # 행동 가능성 제약 적용
             if constraint_fn is not None:
                 x_t = constraint_fn(x_t, x_factual)
 
+        # ── 후처리 정제: clean space에서 gradient ascent ─────────────────────
+        # diffusion 이후에도 분류기 경계를 넘지 못한 경우를 위한 보완
+        if refine_steps > 0:
+            x_t = self._gradient_refine(x_t, x_factual, guidance_fn,
+                                         refine_steps, refine_lr, constraint_fn)
+
         return x_t
+
+    def _gradient_refine(
+        self,
+        x_cf: torch.Tensor,
+        x_factual: torch.Tensor,
+        guidance_fn,
+        steps: int,
+        lr: float,
+        constraint_fn=None,
+    ) -> torch.Tensor:
+        """
+        diffusion 결과를 clean space에서 gradient ascent로 추가 정제.
+        분류기 경계 근처에 있는 샘플들을 목표 클래스 쪽으로 밀어주는 역할.
+        proximity 패널티를 함께 적용해 원본과 너무 멀어지지 않도록 제어.
+        """
+        x = x_cf.detach().clone().requires_grad_(True)
+        optimizer = torch.optim.Adam([x], lr=lr)
+
+        for _ in range(steps):
+            optimizer.zero_grad()
+            log_p       = guidance_fn(x)                          # log p(y=target|x)
+            proximity   = ((x - x_factual.detach()) ** 2).mean()  # 원본과의 거리
+            loss        = -(log_p.mean()) + 0.1 * proximity       # 목표 방향 + proximity 패널티
+            loss.backward()
+            optimizer.step()
+
+            # 정제 중에도 제약 유지
+            with torch.no_grad():
+                if constraint_fn is not None:
+                    x.data = constraint_fn(x.data, x_factual.detach())
+
+        return x.detach()
