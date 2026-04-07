@@ -150,6 +150,7 @@ class TabDiffCFGenerator:
             constraint_fn=lambda xc, xf: self.constraints.apply(xc, xf),
             refine_steps=self.cfg.get("refine_steps", 0),
             refine_lr=self.cfg.get("refine_lr", 0.05),
+            ddim_steps=self.cfg.get("ddim_steps", None),
         )  # (n*k, dim)
 
         x_cf_np = x_cf_all.cpu().numpy()

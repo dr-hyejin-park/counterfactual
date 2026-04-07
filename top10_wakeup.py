@@ -58,7 +58,9 @@ from cf_engine.generator import (
 )
 from scale.data_loader import iter_chunks, count_rows
 from scale.batch_scorer import score_in_chunks, select_top_pct, detect_device
-from scale.parallel_cf import generate_cf_batched, recommend_batch_size
+from scale.parallel_cf import (
+    generate_cf_batched, generate_cf_two_stage, recommend_batch_size
+)
 
 ALL_FEATURES = NUMERICAL_FEATURES + CATEGORICAL_FEATURES
 
@@ -99,15 +101,21 @@ def parse_args():
                    help="CF 배치 크기 (None=자동 추천)")
     p.add_argument("--num_candidates",   type=int,   default=2,
                    help="고객당 CF 후보 수 (대규모 시 2 권장)")
-    # CF timestep / guidance
+    # CF 속도 / 품질 옵션
     p.add_argument("--fast",             action="store_true",
-                   help="빠른 CF: timestep=100")
+                   help="빠른 CF: DDIM 20스텝, 후보 2개, refine 없음")
     p.add_argument("--cf_timesteps",     type=int,   default=None,
-                   help="CF 역확산 스텝 수 (None → fast:100, 일반 400)")
+                   help="부분 노이즈 시작 timestep T_cf (기본 400)")
+    p.add_argument("--ddim_steps",       type=int,   default=None,
+                   help="DDIM 샘플링 스텝 수 (None → config 기본값 50, fast → 20)")
     p.add_argument("--guidance_scale",   type=float, default=None,
                    help="Guidance 강도 λ (None → config 기본값 8.0, 적응형 자동 조정)")
     p.add_argument("--refine_steps",     type=int,   default=None,
                    help="Diffusion 후 gradient 정제 횟수 (None → config 기본값 10)")
+    p.add_argument("--two_stage",        action="store_true", default=True,
+                   help="2-stage CF 생성: 1차 fast → 2차 미달성만 deep (대규모 기본값)")
+    p.add_argument("--no_two_stage",     action="store_true",
+                   help="2-stage 비활성화 (단순 배치 처리)")
     # 출력
     p.add_argument("--output_format",    default="csv", choices=["csv", "parquet"])
     p.add_argument("--resume",           action="store_true",
@@ -410,14 +418,17 @@ def main():
     cf_cfg = dict(CF_CONFIG)
     if args.cf_timesteps:
         cf_cfg["num_cf_timesteps"] = args.cf_timesteps
-    elif args.fast:
-        cf_cfg["num_cf_timesteps"] = 100
-    # 기본값은 CF_CONFIG의 400 사용 (args.cf_timesteps=None, args.fast=False)
-    cf_cfg["num_cf_samples"] = args.num_candidates
+    # --fast: DDIM 20스텝, refine 없음
+    if args.fast:
+        cf_cfg["ddim_steps"]   = 20
+        cf_cfg["refine_steps"] = 0
+    if args.ddim_steps is not None:
+        cf_cfg["ddim_steps"] = args.ddim_steps
     if args.guidance_scale is not None:
         cf_cfg["guidance_scale"] = args.guidance_scale
     if args.refine_steps is not None:
         cf_cfg["refine_steps"] = args.refine_steps
+    cf_cfg["num_cf_samples"] = args.num_candidates
 
     batch_size = args.batch_size or recommend_batch_size(
         device, preprocessor.total_dim, cf_cfg["num_cf_timesteps"]
@@ -498,17 +509,46 @@ def main():
             if os.path.exists(p):
                 os.remove(p)
 
-    results = generate_cf_batched(
-        top_df=top_df,
-        cf_generator=cf_generator,
-        batch_size=batch_size,
-        num_candidates=args.num_candidates,
-        checkpoint_dir=args.output_dir,
-        output_wide_path=wide_path,
-        output_long_path=long_path,
-        resume=args.resume,
-        verbose=True,
-    )
+    use_two_stage = (not args.no_two_stage) and len(top_df) >= 10_000
+
+    if use_two_stage:
+        # 대규모: 2-stage (1차 fast, 2차 미달성 deep)
+        s1_cand    = max(2, args.num_candidates // 2)
+        s2_cand    = args.num_candidates
+        s1_ddim    = cf_cfg.get("ddim_steps", 50) if not args.fast else 20
+        s2_ddim    = cf_cfg.get("ddim_steps", 50)
+        s2_refine  = cf_cfg.get("refine_steps", 10)
+        print(f"  [2-Stage 모드] 1단계 DDIM {s1_ddim}스텝·후보 {s1_cand}개 → "
+              f"2단계 DDIM {s2_ddim}스텝·후보 {s2_cand}개·refine {s2_refine}스텝")
+        results = generate_cf_two_stage(
+            top_df=top_df,
+            cf_generator=cf_generator,
+            batch_size=batch_size,
+            stage1_candidates=s1_cand,
+            stage1_ddim_steps=s1_ddim,
+            stage1_refine_steps=0,
+            stage2_candidates=s2_cand,
+            stage2_ddim_steps=s2_ddim,
+            stage2_refine_steps=s2_refine,
+            checkpoint_dir=args.output_dir,
+            output_wide_path=wide_path,
+            output_long_path=long_path,
+            resume=args.resume,
+            verbose=True,
+        )
+    else:
+        # 소규모 / --fast / --no_two_stage: 단순 배치
+        results = generate_cf_batched(
+            top_df=top_df,
+            cf_generator=cf_generator,
+            batch_size=batch_size,
+            num_candidates=args.num_candidates,
+            checkpoint_dir=args.output_dir,
+            output_wide_path=wide_path,
+            output_long_path=long_path,
+            resume=args.resume,
+            verbose=True,
+        )
 
     # 재시작으로 일부만 새로 생성된 경우 기존 파일 전체 재로드
     if os.path.exists(wide_path):

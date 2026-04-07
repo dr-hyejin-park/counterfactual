@@ -117,4 +117,5 @@ CF_CONFIG = {
     "max_change_ratio": 0.5,
     "refine_steps": 10,          # diffusion 후 gradient ascent 정제 횟수 (0=생략)
     "refine_lr": 0.05,           # 정제 학습률
+    "ddim_steps": 50,            # DDIM 스텝 수 (None=DDPM 전체, 50=8× 빠름)
 }

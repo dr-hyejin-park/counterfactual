@@ -312,6 +312,56 @@ class TabDiff(nn.Module):
 
         return x_prev.detach()
 
+    def ddim_step_with_guidance(
+        self,
+        x_t: torch.Tensor,
+        t: int,
+        t_prev: int,
+        guidance_fn,
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        """
+        DDIM 역확산 한 스텝 (결정론적, x₀-prediction guidance 포함)
+
+        DDPM 대비 장점:
+        - 확률적 노이즈 항 없음 → 균일 간격 큰 스텝 가능 (50스텝으로 400스텝 대체)
+        - 동일 품질, 8× 빠름
+
+        수식:
+          x̂₀ = (x_t - √(1-ᾱ_t)·ε_θ) / √ᾱ_t
+          x_{t_prev} = √ᾱ_{t_prev}·x̂₀ + √(1-ᾱ_{t_prev})·(x_t - √ᾱ_t·x̂₀)/√(1-ᾱ_t)
+        """
+        t_tensor = torch.full((x_t.shape[0],), t, device=x_t.device, dtype=torch.long)
+        x_t_d    = x_t.detach()
+
+        # 1. ε 예측
+        with torch.no_grad():
+            eps_pred = self.denoiser(x_t_d, t_tensor)
+
+        sqrt_a   = self.sqrt_alphas_cumprod[t]
+        sqrt_1ma = self.sqrt_one_minus_alphas_cumprod[t]
+
+        # 2. x₀_pred 복원
+        x_0_pred = (x_t_d - sqrt_1ma * eps_pred) / sqrt_a
+
+        # 3. x₀에서 guidance gradient 계산 (in-distribution)
+        x_0_g    = x_0_pred.detach().requires_grad_(True)
+        log_prob = guidance_fn(x_0_g)
+        grad_x0  = torch.autograd.grad(log_prob.sum(), x_0_g)[0]
+        x_0_pred = (x_0_pred + guidance_scale * grad_x0.detach()).detach()
+
+        # 4. DDIM 스텝 (결정론적, 노이즈 없음)
+        if t_prev > 0:
+            sqrt_a_prev   = self.sqrt_alphas_cumprod[t_prev]
+            sqrt_1ma_prev = self.sqrt_one_minus_alphas_cumprod[t_prev]
+        else:
+            sqrt_a_prev   = torch.ones(1, device=x_t.device)
+            sqrt_1ma_prev = torch.zeros(1, device=x_t.device)
+
+        # ε 방향 (x_t → x₀ 방향의 residual)
+        dir_xt = sqrt_1ma_prev * (x_t_d - sqrt_a * x_0_pred) / (sqrt_1ma + 1e-8)
+        return (sqrt_a_prev * x_0_pred + dir_xt).detach()
+
     # ── 전체 샘플 생성 ────────────────────────────────────────────────────────
 
     @torch.no_grad()
@@ -341,9 +391,10 @@ class TabDiff(nn.Module):
         constraint_fn=None,
         refine_steps: int = 0,
         refine_lr: float = 0.05,
+        ddim_steps: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        반사실적 생성 역확산 루프 (x₀-prediction guidance + 후처리 정제)
+        반사실적 생성 역확산 루프 (DDPM 또는 DDIM + 후처리 정제)
 
         Args:
             x_factual:      원본 고객 데이터 (인코딩됨)
@@ -353,15 +404,31 @@ class TabDiff(nn.Module):
             constraint_fn:  제약 함수 (optional)
             refine_steps:   diffusion 후 gradient ascent 정제 횟수 (0=생략)
             refine_lr:      정제 스텝 학습률
+            ddim_steps:     None → DDPM 전체 스텝 / 정수 → DDIM N스텝 (8× 빠름)
         Returns:
             x_cf: 반사실적 데이터
         """
         x_t = self.partial_noise(x_factual, t_start)
 
-        for t in reversed(range(t_start)):
-            x_t = self.p_sample_with_guidance(x_t, t, guidance_fn, guidance_scale)
-            if constraint_fn is not None:
-                x_t = constraint_fn(x_t, x_factual)
+        if ddim_steps is not None and ddim_steps < t_start:
+            # ── DDIM: 균일 간격으로 t_start → 0 점프 ─────────────────────────
+            # step_indices: [0, ..., t_start-1] 에서 ddim_steps개 균일 선택
+            indices  = np.linspace(0, t_start - 1, ddim_steps + 1, dtype=int)
+            t_seq    = list(reversed(indices[1:]))   # [t_start-1, ..., 큰 t]
+            tp_seq   = list(reversed(indices[:-1]))  # [큰 t-1, ..., 0]
+
+            for t, t_prev in zip(t_seq, tp_seq):
+                x_t = self.ddim_step_with_guidance(
+                    x_t, int(t), int(t_prev), guidance_fn, guidance_scale
+                )
+                if constraint_fn is not None:
+                    x_t = constraint_fn(x_t, x_factual)
+        else:
+            # ── DDPM: 모든 스텝 ───────────────────────────────────────────────
+            for t in reversed(range(t_start)):
+                x_t = self.p_sample_with_guidance(x_t, t, guidance_fn, guidance_scale)
+                if constraint_fn is not None:
+                    x_t = constraint_fn(x_t, x_factual)
 
         # ── 후처리 정제: clean space에서 gradient ascent ─────────────────────
         # diffusion 이후에도 분류기 경계를 넘지 못한 경우를 위한 보완
