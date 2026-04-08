@@ -219,8 +219,11 @@ def generate_cf_two_stage(
     elapsed1 = time.time() - t0
     n_valid1  = sum(1 for r in stage1_results.values() if r["cf_valid"])
     n_invalid = len(stage1_results) - n_valid1
-    print(f"  1단계 완료: {len(stage1_results):,}명 | 유효 {n_valid1:,}명 "
-          f"({n_valid1/max(len(stage1_results),1)*100:.1f}%) | {elapsed1:.0f}초")
+    n_stage1    = len(stage1_results)
+    valid1_pct  = n_valid1 / max(n_stage1, 1) * 100
+    elapsed1_s  = int(elapsed1)
+    print(f"  1단계 완료: {n_stage1:,}명 | 유효 {n_valid1:,}명 "
+          f"({valid1_pct:.1f}%) | {elapsed1_s}초")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Stage 2 — 미달성 고객만 Deep CF
@@ -283,10 +286,12 @@ def generate_cf_two_stage(
                 )
 
         elapsed2  = time.time() - t2
-        n_valid2  = sum(1 for r in stage1_results.values() if r["cf_valid"])
-        print(f"  2단계 완료: 유효율 {n_valid1/max(len(stage1_results),1)*100:.1f}% → "
-              f"{n_valid2/max(len(stage1_results),1)*100:.1f}% "
-              f"(개선 {improved:,}명) | {elapsed2:.0f}초")
+        n_valid2   = sum(1 for r in stage1_results.values() if r["cf_valid"])
+        valid1_pct = n_valid1 / max(n_stage1, 1) * 100
+        valid2_pct = n_valid2 / max(n_stage1, 1) * 100
+        elapsed2_s = int(elapsed2)
+        print(f"  2단계 완료: 유효율 {valid1_pct:.1f}% → {valid2_pct:.1f}% "
+              f"(개선 {improved:,}명) | {elapsed2_s}초")
 
     # config 복원
     cf_generator.cfg = orig_cfg
