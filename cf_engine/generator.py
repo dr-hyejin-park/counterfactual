@@ -127,6 +127,9 @@ class TabDiffCFGenerator:
             cf_list: 고객별 CF 후보 DataFrame 리스트 (n개)
         """
         n = len(customer_df)
+        if n == 0:
+            return []
+
         x_factual_np = self.preprocessor.transform(
             customer_df[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]
         )  # (n, dim)
@@ -171,6 +174,9 @@ class TabDiffCFGenerator:
         후보 중 최적 CF 선택
         기준: 분류기가 활성(0)으로 예측 + 원본과 거리 최소
         """
+        if cf_candidates is None or len(cf_candidates) == 0:
+            return factual_row  # fallback: 유효 후보 없으면 원본 반환
+
         x_factual_np = self.preprocessor.transform(
             pd.DataFrame([factual_row[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]])
         )

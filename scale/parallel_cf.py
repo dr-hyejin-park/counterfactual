@@ -70,6 +70,9 @@ def _run_batch(
     start_offset: int,
 ) -> List[dict]:
     """하나의 mini-batch에 대해 CF를 생성하고 결과 dict 리스트 반환"""
+    if len(batch_df) == 0:
+        return []
+
     cf_list = cf_generator.generate_for_batch(
         customer_df=batch_df,
         num_candidates=num_candidates,
@@ -239,6 +242,12 @@ def generate_cf_two_stage(
         cf_generator.cfg["num_cf_samples"] = stage2_candidates
 
         invalid_df = top_df[top_df["customer_id"].isin(set(invalid_ids))].reset_index(drop=True)
+
+        if len(invalid_df) == 0:
+            print("  2단계 skip: invalid_df가 비어있음 (customer_id 타입 불일치 가능성)")
+            cf_generator.cfg = orig_cfg
+            return all_results
+
         n_batches2 = math.ceil(len(invalid_df) / batch_size)
         pbar2_desc = (f"[2단계] Deep CF "
                       f"(refine {stage2_refine_steps}스텝, 후보 {stage2_candidates}개)")
