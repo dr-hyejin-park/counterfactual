@@ -133,14 +133,20 @@ def generate_cf_two_stage(
     top_df: pd.DataFrame,
     cf_generator: TabDiffCFGenerator,
     batch_size: int = 256,
-    # Stage 1: 전체 고객 fast CF
+    # Stage 1: 전체 고객 fast CF (DDIM)
     stage1_candidates: int = 3,
     stage1_ddim_steps: int = 50,
     stage1_refine_steps: int = 0,
-    # Stage 2: 미달성 고객 deep CF
+    # Stage 2: 미달성 고객 deep CF (DDIM + refine)
     stage2_candidates: int = 5,
     stage2_ddim_steps: int = 50,
-    stage2_refine_steps: int = 10,
+    stage2_refine_steps: int = 30,
+    # Stage 3: 여전히 미달성 고객에 direct optimization (fallback)
+    stage3_candidates: int = 4,
+    stage3_opt_iter: int = 200,
+    stage3_opt_lr: float = 0.02,
+    stage3_proximity_weight: float = 0.01,
+    stage3_noise_std: float = 0.3,
     # 공통
     checkpoint_dir: Optional[str] = None,
     output_wide_path: Optional[str] = None,
@@ -149,18 +155,25 @@ def generate_cf_two_stage(
     verbose: bool = True,
 ) -> List[dict]:
     """
-    2단계 CF 생성 — 대규모(80만 명+) 최적화 전략
+    3단계 CF 생성 — 대규모(80만 명+) 최적화 전략
 
     Stage 1: 모든 고객에 DDIM 50스텝 fast CF (후보 3개, refine 없음)
              → 전체를 빠르게 커버
-    Stage 2: Stage 1에서 CF가 무효(cf_prob >= 0.5)인 고객에만
-             추가 후보 + refine 적용
-             → 비용을 미달성 비율만큼만 추가 부담
+    Stage 2: Stage 1에서 무효(cf_prob >= 0.5)인 고객에만
+             DDIM + refine 30스텝 추가 적용
+    Stage 3: Stage 2 이후에도 무효인 고객에 direct optimization (fallback)
+             → diffusion guidance가 실패해도 gradient ascent로 경계 돌파 보장
+
+    [Stage 3 원리]
+    diffusion은 denoiser의 factual 방향 prior가 강해 고위험 고객에서
+    guidance가 누적되지 않습니다. 직접 최적화는 hinge loss로 분류기
+    경계를 명시적 목표로 삼아 validity가 훨씬 안정적입니다.
 
     처리 시간 예시 (A100 기준, batch=512, DDIM 50스텝):
       800K 전체  1단계: ~10분
-      ~200K 재시도 2단계: ~7분
-      합계: ≈ 17분 (vs DDPM 400스텝 batch=32: 수십 시간)
+      ~790K 재시도 2단계: ~30분 (refine 30스텝)
+      ~790K 재시도 3단계: ~15분 (direct opt 200iter)
+      합계: ≈ 55분 (validity 80%+ 목표)
     """
     os.makedirs(checkpoint_dir, exist_ok=True) if checkpoint_dir else None
 
@@ -301,6 +314,113 @@ def generate_cf_two_stage(
         elapsed2_s = int(elapsed2)
         print(f"  2단계 완료: 유효율 {valid1_pct:.1f}% → {valid2_pct:.1f}% "
               f"(개선 {improved:,}명) | {elapsed2_s}초")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Stage 3 — Direct Optimization Fallback (여전히 무효인 고객)
+    # diffusion+guidance가 denoiser prior에 압도될 때도 gradient ascent로 경계 돌파
+    # ══════════════════════════════════════════════════════════════════════════
+    still_invalid = [cid for cid, r in stage1_results.items() if not r["cf_valid"]]
+
+    if still_invalid and stage3_opt_iter > 0:
+        n_still = len(still_invalid)
+        print(f"\n  [3단계] Direct Optimization fallback: {n_still:,}명 "
+              f"(후보 {stage3_candidates}개 × {stage3_opt_iter}iter)")
+
+        still_invalid_df = top_df[
+            top_df["customer_id"].isin(set(still_invalid))
+        ].reset_index(drop=True)
+
+        if len(still_invalid_df) == 0:
+            print("  3단계 skip: still_invalid_df 비어있음 (customer_id 타입 불일치 가능)")
+        else:
+            t3 = time.time()
+            improved3 = 0
+            n_batches3 = math.ceil(len(still_invalid_df) / batch_size)
+            pbar3_desc = f"[3단계] Direct Opt (iter {stage3_opt_iter}, 후보 {stage3_candidates}개)"
+            pbar3 = tqdm(total=len(still_invalid_df), desc=pbar3_desc, unit="명") if verbose else None
+
+            for b_idx in range(n_batches3):
+                s = b_idx * batch_size
+                e = min(s + batch_size, len(still_invalid_df))
+                batch_df = still_invalid_df.iloc[s:e]
+
+                if len(batch_df) == 0:
+                    continue
+
+                # direct optimization으로 CF 생성
+                cf_list = cf_generator.generate_cf_direct_opt(
+                    customer_df=batch_df,
+                    num_candidates=stage3_candidates,
+                    max_iter=stage3_opt_iter,
+                    lr=stage3_opt_lr,
+                    proximity_weight=stage3_proximity_weight,
+                    noise_std=stage3_noise_std,
+                )
+
+                for i, (_, row) in enumerate(batch_df.iterrows()):
+                    if i >= len(cf_list):
+                        break
+                    best_cf = cf_generator.select_best_cf(cf_list[i], row)
+                    x_cf_enc = cf_generator.preprocessor.transform(
+                        pd.DataFrame([best_cf[ALL_FEATURES]])
+                    )
+                    x_cf_t = torch.tensor(x_cf_enc, dtype=torch.float32,
+                                          device=cf_generator.device)
+                    with torch.no_grad():
+                        cf_prob = float(
+                            cf_generator.classifier.predict_proba(x_cf_t).cpu().numpy()[0]
+                        )
+
+                    cid = row.get("customer_id", f"C_{s + i}")
+                    if cf_prob < stage1_results[cid]["cf_prob"]:
+                        updated = {
+                            "customer_id":    cid,
+                            "factual":        row,
+                            "counterfactual": best_cf,
+                            "factual_prob":   float(row.get("risk_prob", 0.0)),
+                            "cf_prob":        cf_prob,
+                            "cf_valid":       cf_prob < 0.5,
+                            "treatments":     cf_generator._extract_treatments(row, best_cf),
+                            "num_changes":    len(cf_generator._extract_treatments(row, best_cf)),
+                        }
+                        stage1_results[cid] = updated
+                        improved3 += 1
+                        for idx, existing in enumerate(all_results):
+                            if existing["customer_id"] == cid:
+                                all_results[idx] = updated
+                                break
+
+                if pbar3:
+                    pbar3.update(len(batch_df))
+
+            if pbar3:
+                pbar3.close()
+
+            # 3단계 결과로 CSV 재기록
+            if output_wide_path:
+                wide_rows = [build_treatment_rows(r) for r in stage1_results.values()]
+                pd.DataFrame(wide_rows).to_csv(
+                    output_wide_path, index=False, encoding="utf-8-sig"
+                )
+            if output_long_path:
+                long_rows = []
+                for r in stage1_results.values():
+                    long_rows.extend(build_action_rows(r))
+                if long_rows:
+                    pd.DataFrame(long_rows).to_csv(
+                        output_long_path, index=False, encoding="utf-8-sig"
+                    )
+
+            elapsed3  = time.time() - t3
+            n_valid3  = sum(1 for r in stage1_results.values() if r["cf_valid"])
+            valid2_pct = sum(1 for r in stage1_results.values() if r["cf_valid"]) / max(n_stage1, 1) * 100
+            # recompute after stage3
+            n_valid_pre3  = n_stage1 - n_still
+            valid_pre3_pct = n_valid_pre3 / max(n_stage1, 1) * 100
+            valid3_pct    = n_valid3 / max(n_stage1, 1) * 100
+            elapsed3_s    = int(elapsed3)
+            print(f"  3단계 완료: 유효율 {valid_pre3_pct:.1f}% → {valid3_pct:.1f}% "
+                  f"(개선 {improved3:,}명) | {elapsed3_s}초")
 
     # config 복원
     cf_generator.cfg = orig_cfg

@@ -168,6 +168,89 @@ class TabDiffCFGenerator:
             )
         return cf_list
 
+    def generate_cf_direct_opt(
+        self,
+        customer_df: pd.DataFrame,
+        num_candidates: int = 4,
+        max_iter: int = 200,
+        lr: float = 0.02,
+        proximity_weight: float = 0.01,
+        noise_std: float = 0.3,
+        margin: float = 0.3,
+    ) -> List[pd.DataFrame]:
+        """
+        순수 gradient 최적화 기반 CF 생성 (diffusion 없음) — Stage 3 fallback.
+
+        [원리]
+        diffusion + guidance는 denoiser의 factual 방향 prior가 강해
+        고위험 고객에서 분류기 경계 돌파가 어렵습니다.
+        직접 최적화는 분류기 경계를 hinge loss로 명시적으로 목표로 삼아
+        reliability와 validity가 훨씬 높습니다.
+
+        목적함수:
+            min_x  max(0, f(x) + margin)  +  w · ||x - x_factual||²
+                   ↑ logit 이 -margin 이하로 떨어질 때까지 push
+                   ↑ proximity 패널티
+
+        비용: 배치 내 모든 고객을 동시에 처리 (GPU 효율 동일)
+
+        Args:
+            customer_df:      고객 DataFrame (n행)
+            num_candidates:   고객당 최적화 시작점 수 (다양한 난수 초기화)
+            max_iter:         gradient 최적화 반복 횟수
+            lr:               Adam 학습률
+            proximity_weight: ||x - x_factual||² 계수 (작을수록 경계 돌파 우선)
+            noise_std:        초기 랜덤 perturbation 크기
+            margin:           목표 logit 여유값 (margin=0.3 → P(risk=1) < 0.43 목표)
+        Returns:
+            cf_list: 고객별 CF 후보 DataFrame 리스트 (n개)
+        """
+        n = len(customer_df)
+        if n == 0:
+            return []
+
+        x_factual_np = self.preprocessor.transform(
+            customer_df[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]
+        )
+        x_factual_t = torch.tensor(x_factual_np, dtype=torch.float32, device=self.device)
+
+        # 각 고객을 num_candidates 번 복제 (다양한 시작점)
+        x_factual_rep = x_factual_t.repeat_interleave(num_candidates, dim=0)  # (n*k, dim)
+
+        # 랜덤 perturbation으로 다양한 시작점 생성
+        x = x_factual_rep.detach().clone()
+        x = x + noise_std * torch.randn_like(x)
+        with torch.no_grad():
+            x = self.constraints.apply(x, x_factual_rep)
+        x = x.requires_grad_(True)
+
+        optimizer = torch.optim.Adam([x], lr=lr)
+
+        for _ in range(max_iter):
+            optimizer.zero_grad()
+
+            logits = self.classifier(x)                        # (n*k,) — raw logit
+            # Hinge: logit 이 -margin 이하면 0, 아니면 경계 방향으로 push
+            hinge = torch.clamp(logits + margin, min=0.0)
+            proximity = ((x - x_factual_rep.detach()) ** 2).sum(dim=1)
+            loss = hinge.mean() + proximity_weight * proximity.mean()
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([x], max_norm=1.0)
+            optimizer.step()
+
+            with torch.no_grad():
+                x.data = self.constraints.apply(x.data, x_factual_rep)
+
+        x_cf_np = x.detach().cpu().numpy()
+
+        cf_list = []
+        for i in range(n):
+            s = i * num_candidates
+            e = s + num_candidates
+            cf_list.append(self.preprocessor.inverse_transform(x_cf_np[s:e]))
+        return cf_list
+
     def select_best_cf(self, cf_candidates: pd.DataFrame,
                         factual_row: pd.Series) -> pd.Series:
         """

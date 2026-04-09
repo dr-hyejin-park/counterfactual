@@ -106,16 +106,17 @@ CLASSIFIER_CONFIG = {
 
 # ─── 반사실적 생성 설정 ─────────────────────────────────────────────────────────
 CF_CONFIG = {
-    "num_cf_timesteps": 400,     # 반사실적 생성에 사용할 확산 스텝 수 (T_cf)
-                                  # 300→400: 더 많은 역확산 스텝 = 경계 초과 기회 증가
-    "guidance_scale": 8.0,       # 분류기 guidance 강도 λ
-                                  # 3.0→8.0: x₀-prediction 방식으로 변경 후 적절 강도
+    "num_cf_timesteps": 600,     # 반사실적 생성에 사용할 확산 스텝 수 (T_cf)
+                                  # 400→600: noise level 높여 역확산 탐색 범위 확대
+    "guidance_scale": 50.0,      # 분류기 guidance 강도 λ
+                                  # 8.0→50.0: denoiser prior 압도를 위해 대폭 증가
+                                  # DDIM에서 각 스텝마다 x₀_pred가 재예측되어
+                                  # guidance가 누적되지 않으므로 충분히 강해야 함
     "num_cf_samples": 8,         # 고객당 생성할 후보 CF 수
-                                  # 5→8: 후보 다양성 증가 → 유효 CF 발견 확률 상승
     "target_class": 0,           # 목표 클래스 (0 = 활성 고객, 무실적 위험 해제)
-    "proximity_weight": 0.5,
-    "max_change_ratio": 0.5,
-    "refine_steps": 10,          # diffusion 후 gradient ascent 정제 횟수 (0=생략)
+    "proximity_weight": 0.005,   # 0.5→0.005: refine 시 경계 돌파 우선
+    "max_change_ratio": 0.8,     # 0.5→0.8: 고위험 고객은 큰 변화 필요
+    "refine_steps": 30,          # 10→30: 정제 스텝 증가
     "refine_lr": 0.05,           # 정제 학습률
     "ddim_steps": 50,            # DDIM 스텝 수 (None=DDPM 전체, 50=8× 빠름)
 }

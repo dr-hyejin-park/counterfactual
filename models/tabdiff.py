@@ -459,8 +459,9 @@ class TabDiff(nn.Module):
             optimizer.zero_grad()
             log_p       = guidance_fn(x)                          # log p(y=target|x)
             proximity   = ((x - x_factual.detach()) ** 2).mean()  # 원본과의 거리
-            loss        = -(log_p.mean()) + 0.1 * proximity       # 목표 방향 + proximity 패널티
+            loss        = -(log_p.mean()) + 0.005 * proximity     # 0.1→0.005: proximity 억제
             loss.backward()
+            torch.nn.utils.clip_grad_norm_([x], max_norm=1.0)    # gradient 폭발 방지
             optimizer.step()
 
             # 정제 중에도 제약 유지
