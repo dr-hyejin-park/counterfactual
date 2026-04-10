@@ -347,14 +347,18 @@ def generate_cf_two_stage(
                 if len(batch_df) == 0:
                     continue
 
-                # direct optimization으로 CF 생성
+                # direct optimization으로 CF 생성 (희소성 + 피처 중요도 마스킹)
+                cfg = cf_generator.cfg
                 cf_list = cf_generator.generate_cf_direct_opt(
                     customer_df=batch_df,
                     num_candidates=stage3_candidates,
                     max_iter=stage3_opt_iter,
                     lr=stage3_opt_lr,
                     proximity_weight=stage3_proximity_weight,
+                    sparsity_weight=cfg.get("sparsity_weight", 0.1),
+                    max_changes=cfg.get("max_cf_changes", 4),
                     noise_std=stage3_noise_std,
+                    margin=0.3,
                 )
 
                 for i, (_, row) in enumerate(batch_df.iterrows()):

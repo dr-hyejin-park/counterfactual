@@ -349,6 +349,9 @@ class TabDiff(nn.Module):
         log_prob = guidance_fn(x_0_g)
         grad_x0  = torch.autograd.grad(log_prob.sum(), x_0_g)[0]
         x_0_pred = (x_0_pred + guidance_scale * grad_x0.detach()).detach()
+        # OOD 방지: guidance 후 x_0_pred를 ±3.5σ 범위로 클리핑
+        # guidance_scale이 클 때 x_0_pred가 학습 분포 밖으로 나가는 것 방지
+        x_0_pred = x_0_pred.clamp(-3.5, 3.5)
 
         # 4. DDIM 스텝 (결정론적, 노이즈 없음)
         if t_prev > 0:

@@ -513,16 +513,18 @@ def main():
 
     if use_two_stage:
         # 대규모: 3-stage (1차 fast DDIM → 2차 deep DDIM → 3차 direct opt)
-        s1_cand    = max(2, args.num_candidates // 2)
-        s2_cand    = args.num_candidates
-        s1_ddim    = cf_cfg.get("ddim_steps", 50) if not args.fast else 20
-        s2_ddim    = cf_cfg.get("ddim_steps", 50)
-        s2_refine  = 0 if args.fast else cf_cfg.get("refine_steps", 30)
-        s3_iter    = 0 if args.fast else 200
+        s1_cand      = max(2, args.num_candidates // 2)
+        s2_cand      = args.num_candidates
+        s1_ddim      = cf_cfg.get("ddim_steps", 50) if not args.fast else 20
+        s2_ddim      = cf_cfg.get("ddim_steps", 50)
+        s2_refine    = 0 if args.fast else cf_cfg.get("refine_steps", 30)
+        s3_iter      = 0 if args.fast else 200
+        s3_max_chg   = cf_cfg.get("max_cf_changes", 4)
+        s3_sparsity  = cf_cfg.get("sparsity_weight", 0.1)
         print(f"  [3-Stage 모드] "
               f"1단계 DDIM {s1_ddim}스텝·후보 {s1_cand}개 → "
               f"2단계 DDIM {s2_ddim}스텝·후보 {s2_cand}개·refine {s2_refine}스텝 → "
-              f"3단계 DirectOpt {s3_iter}iter")
+              f"3단계 DirectOpt {s3_iter}iter·최대변경 {s3_max_chg}피처")
         results = generate_cf_two_stage(
             top_df=top_df,
             cf_generator=cf_generator,

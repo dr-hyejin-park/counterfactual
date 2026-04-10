@@ -106,17 +106,22 @@ CLASSIFIER_CONFIG = {
 
 # ─── 반사실적 생성 설정 ─────────────────────────────────────────────────────────
 CF_CONFIG = {
-    "num_cf_timesteps": 600,     # 반사실적 생성에 사용할 확산 스텝 수 (T_cf)
-                                  # 400→600: noise level 높여 역확산 탐색 범위 확대
-    "guidance_scale": 50.0,      # 분류기 guidance 강도 λ
-                                  # 8.0→50.0: denoiser prior 압도를 위해 대폭 증가
-                                  # DDIM에서 각 스텝마다 x₀_pred가 재예측되어
-                                  # guidance가 누적되지 않으므로 충분히 강해야 함
+    "num_cf_timesteps": 500,     # 반사실적 생성에 사용할 확산 스텝 수 (T_cf)
+    "guidance_scale": 10.0,      # 분류기 guidance 강도 λ
+                                  # [주의] 50.0은 OOD(분포 외) CF를 생성해 분류기를
+                                  # adversarial하게 속이는 문제 발생 → 10.0으로 복원
+                                  # Stage 1/2에서 validity가 낮더라도 Stage 3(direct opt)가
+                                  # 현실적인 희소 CF를 보장
     "num_cf_samples": 8,         # 고객당 생성할 후보 CF 수
     "target_class": 0,           # 목표 클래스 (0 = 활성 고객, 무실적 위험 해제)
-    "proximity_weight": 0.005,   # 0.5→0.005: refine 시 경계 돌파 우선
-    "max_change_ratio": 0.8,     # 0.5→0.8: 고위험 고객은 큰 변화 필요
-    "refine_steps": 30,          # 10→30: 정제 스텝 증가
+    "proximity_weight": 0.005,   # _gradient_refine 내 proximity 계수
+    "max_change_ratio": 0.5,
+    "refine_steps": 30,          # diffusion 후 gradient ascent 정제 횟수
     "refine_lr": 0.05,           # 정제 학습률
-    "ddim_steps": 50,            # DDIM 스텝 수 (None=DDPM 전체, 50=8× 빠름)
+    "ddim_steps": 50,            # DDIM 스텝 수
+    # ── CF 품질 제어 (Stage 3 direct optimization) ────────────────────────────
+    "max_cf_changes": 4,         # 고객당 변경 허용 최대 수치형 피처 수
+                                  # 4개 이하 피처 변화 = 실행 가능한 캠페인 목표
+    "sparsity_weight": 0.1,      # L1 희소성 패널티 강도 (클수록 변화 수 감소)
+    "distribution_bound": 3.0,   # 정규화 공간 클리핑 범위 (±3σ = 학습 분포 내)
 }

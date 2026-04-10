@@ -174,34 +174,38 @@ class TabDiffCFGenerator:
         num_candidates: int = 4,
         max_iter: int = 200,
         lr: float = 0.02,
-        proximity_weight: float = 0.01,
+        proximity_weight: float = 0.05,
+        sparsity_weight: float = 0.1,
+        max_changes: int = 4,
         noise_std: float = 0.3,
         margin: float = 0.3,
     ) -> List[pd.DataFrame]:
         """
-        순수 gradient 최적화 기반 CF 생성 (diffusion 없음) — Stage 3 fallback.
+        희소 gradient 최적화 기반 CF 생성 — Stage 3 fallback.
 
-        [원리]
-        diffusion + guidance는 denoiser의 factual 방향 prior가 강해
-        고위험 고객에서 분류기 경계 돌파가 어렵습니다.
-        직접 최적화는 분류기 경계를 hinge loss로 명시적으로 목표로 삼아
-        reliability와 validity가 훨씬 높습니다.
+        [핵심 개선점]
+        1. 피처 중요도 마스킹: 고객별로 분류기 gradient가 큰 상위 max_changes개
+           수치형 피처만 변경 허용 → 개인화 + 희소성
+        2. L1 sparsity 패널티: 변화량 총합 최소화 → 적은 수의 큰 변화 유도
+        3. 분포 범위 제한: 정규화 공간에서 ±3σ 이내 유지 → 현실적 값 보장
+        4. 비즈니스 제약: 단조 증가/감소 제약은 기존과 동일하게 적용
 
         목적함수:
-            min_x  max(0, f(x) + margin)  +  w · ||x - x_factual||²
-                   ↑ logit 이 -margin 이하로 떨어질 때까지 push
-                   ↑ proximity 패널티
-
-        비용: 배치 내 모든 고객을 동시에 처리 (GPU 효율 동일)
+            min_x  max(0, f(x) + margin)          # hinge: 분류기 경계 돌파
+                 + sparsity_weight · Σ|x_i - xf_i|  # L1: 변화 피처 수 최소화
+          s.t.  x ∈ [xf - 3σ, xf + 3σ]             # 분포 범위 제한
+                actionability constraints            # 단조/불변 제약
 
         Args:
-            customer_df:      고객 DataFrame (n행)
-            num_candidates:   고객당 최적화 시작점 수 (다양한 난수 초기화)
-            max_iter:         gradient 최적화 반복 횟수
-            lr:               Adam 학습률
-            proximity_weight: ||x - x_factual||² 계수 (작을수록 경계 돌파 우선)
-            noise_std:        초기 랜덤 perturbation 크기
-            margin:           목표 logit 여유값 (margin=0.3 → P(risk=1) < 0.43 목표)
+            customer_df:       고객 DataFrame (n행)
+            num_candidates:    고객당 최적화 시작점 수 (다양한 난수 초기화)
+            max_iter:          gradient 최적화 반복 횟수
+            lr:                Adam 학습률
+            proximity_weight:  L2 근접성 패널티 (비활성화: 0.05로 낮춤)
+            sparsity_weight:   L1 희소성 패널티 (변화 피처 수 최소화)
+            max_changes:       고객당 변경 허용 최대 피처 수 (개인화)
+            noise_std:         초기 랜덤 perturbation 크기
+            margin:            목표 logit 여유값 (0.3 → P < 0.43 목표)
         Returns:
             cf_list: 고객별 CF 후보 DataFrame 리스트 (n개)
         """
@@ -213,14 +217,49 @@ class TabDiffCFGenerator:
             customer_df[NUMERICAL_FEATURES + CATEGORICAL_FEATURES]
         )
         x_factual_t = torch.tensor(x_factual_np, dtype=torch.float32, device=self.device)
+        num_dim = self.preprocessor.num_dim
 
-        # 각 고객을 num_candidates 번 복제 (다양한 시작점)
+        # ── 1. 고객별 피처 중요도 계산 (분류기 gradient at factual) ──────────────
+        # 어떤 피처를 바꿔야 분류기 판단이 가장 크게 바뀌는지 → 개인화
+        x_probe = x_factual_t.detach().clone().requires_grad_(True)
+        logits_probe = self.classifier(x_probe)
+        feat_grads = torch.autograd.grad(
+            logits_probe.sum(), x_probe
+        )[0].detach()  # (n, dim)
+
+        # ── 2. 불변 피처 제외 후 상위 max_changes 수치형 피처 선택 ────────────────
+        actionable_mask = torch.ones(num_dim, device=self.device)
+        for feat in IMMUTABLE_FEATURES:
+            if feat in NUMERICAL_FEATURES:
+                actionable_mask[NUMERICAL_FEATURES.index(feat)] = 0.0
+
+        num_grads_abs = feat_grads[:, :num_dim].abs() * actionable_mask  # (n, num_dim)
+        k = min(max_changes, int(actionable_mask.sum().item()))
+        _, topk_idx = torch.topk(num_grads_abs, k=k, dim=1)   # (n, k)
+
+        # sparse mask: 허용된 수치형 피처만 1
+        num_change_mask = torch.zeros(n, num_dim, device=self.device)
+        num_change_mask.scatter_(1, topk_idx, 1.0)
+        # 불변 피처는 절대 변경 불가
+        num_change_mask = num_change_mask * actionable_mask.unsqueeze(0)
+
+        # 전체 마스크 (수치 + 범주형 — 범주형은 모두 허용)
+        cat_dim = self.preprocessor.total_dim - num_dim
+        full_mask = torch.cat([
+            num_change_mask,
+            torch.ones(n, cat_dim, device=self.device),
+        ], dim=1)  # (n, total_dim)
+
+        # 각 고객을 num_candidates 번 복제
         x_factual_rep = x_factual_t.repeat_interleave(num_candidates, dim=0)  # (n*k, dim)
+        mask_rep = full_mask.repeat_interleave(num_candidates, dim=0)          # (n*k, dim)
 
-        # 랜덤 perturbation으로 다양한 시작점 생성
+        # ── 3. 다양한 초기점으로 최적화 시작 ────────────────────────────────────
         x = x_factual_rep.detach().clone()
-        x = x + noise_std * torch.randn_like(x)
+        x = x + noise_std * torch.randn_like(x) * mask_rep  # masked 방향으로만 perturbation
         with torch.no_grad():
+            # ±3σ 분포 범위 초기 클리핑 (OOD 방지)
+            x[:, :num_dim] = x[:, :num_dim].clamp(-3.0, 3.0)
             x = self.constraints.apply(x, x_factual_rep)
         x = x.requires_grad_(True)
 
@@ -229,17 +268,27 @@ class TabDiffCFGenerator:
         for _ in range(max_iter):
             optimizer.zero_grad()
 
-            logits = self.classifier(x)                        # (n*k,) — raw logit
-            # Hinge: logit 이 -margin 이하면 0, 아니면 경계 방향으로 push
-            hinge = torch.clamp(logits + margin, min=0.0)
-            proximity = ((x - x_factual_rep.detach()) ** 2).sum(dim=1)
-            loss = hinge.mean() + proximity_weight * proximity.mean()
+            logits = self.classifier(x)                       # (n*k,)
+            hinge = torch.clamp(logits + margin, min=0.0)    # boundary push
 
+            # L1 sparsity: 변화한 수치형 피처들의 절대값 합
+            delta_num = (x - x_factual_rep.detach())[:, :num_dim]
+            sparsity = (delta_num.abs() * mask_rep[:, :num_dim]).sum(dim=1)
+
+            loss = hinge.mean() + sparsity_weight * sparsity.mean()
             loss.backward()
+
+            # 허용된 피처에만 gradient 적용 (마스킹)
+            with torch.no_grad():
+                x.grad.data *= mask_rep
+
             torch.nn.utils.clip_grad_norm_([x], max_norm=1.0)
             optimizer.step()
 
             with torch.no_grad():
+                # ±3σ 클리핑: 분포 외 값 방지
+                x.data[:, :num_dim] = x.data[:, :num_dim].clamp(-3.0, 3.0)
+                # 행동가능성 제약 (단조/불변)
                 x.data = self.constraints.apply(x.data, x_factual_rep)
 
         x_cf_np = x.detach().cpu().numpy()
@@ -272,14 +321,25 @@ class TabDiffCFGenerator:
 
         # 활성 고객 예측: prob < 0.5 (inactive_risk=0)
         valid_mask = cf_probs < 0.5
+        num_dim = self.preprocessor.num_dim
+
+        # 수치형 공간에서 변경된 피처 수 (희소성) 계산
+        # 임계값 0.1σ: 정규화 공간에서 0.1 미만 변화는 노이즈로 간주
+        diffs = np.abs(x_cf_np[:, :num_dim] - x_factual_np[:, :num_dim])
+        num_changes = (diffs > 0.10).sum(axis=1)   # (n_candidates,)
+
         if valid_mask.any():
             valid_idx = np.where(valid_mask)[0]
-            dists = np.linalg.norm(
-                x_cf_np[valid_idx, :self.preprocessor.num_dim]
-                - x_factual_np[:, :self.preprocessor.num_dim],
+            # 유효한 CF 중: 변경 피처 수 최소 → 동점이면 거리 최소
+            changes_valid = num_changes[valid_idx]
+            dists_valid = np.linalg.norm(
+                x_cf_np[valid_idx, :num_dim]
+                - x_factual_np[:, :num_dim],
                 axis=1,
             )
-            best_idx = valid_idx[np.argmin(dists)]
+            # 희소성 점수 = changes * 10 + normalized_dist (changes 우선)
+            score = changes_valid * 10.0 + dists_valid / (dists_valid.max() + 1e-8)
+            best_idx = valid_idx[np.argmin(score)]
         else:
             # 유효한 CF 없으면 확률 최소(가장 활성에 가까운) 선택
             best_idx = int(np.argmin(cf_probs))
