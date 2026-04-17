@@ -62,6 +62,12 @@ class HyundaiCardPreprocessor:
         self.cat_dim = offset - self.num_dim
         self.total_dim = self.num_dim + self.cat_dim
         self.is_fitted = True
+
+        # Plausibility 평가를 위한 피처별 분포 범위 저장 (5th/95th percentile)
+        num_array = df[NUMERICAL_FEATURES].values.astype(float)
+        self.num_pct05 = np.percentile(num_array, 5, axis=0)   # (num_dim,)
+        self.num_pct95 = np.percentile(num_array, 95, axis=0)  # (num_dim,)
+
         return self
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:

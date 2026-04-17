@@ -51,6 +51,7 @@ def score_in_chunks(
     # ── 재시작 처리: 이미 처리된 청크 파악 ──────────────────────────────────
     checkpoint_path = output_path.replace(".csv", "_ckpt.csv") if output_path else None
     processed_ids: set = set()
+    all_results = []   # ← all_results를 먼저 선언해야 checkpoint 로드 시 append 가능
 
     if resume and checkpoint_path and os.path.exists(checkpoint_path):
         done_df = pd.read_csv(checkpoint_path)          # 전체 컬럼 로드
@@ -63,7 +64,6 @@ def score_in_chunks(
 
     total_rows  = count_rows(data_path)
     n_chunks    = math.ceil(total_rows / chunk_size)
-    all_results = []
     t0          = time.time()
 
     pbar = tqdm(total=total_rows, desc="무실적 위험도 추론", unit="명")
@@ -152,6 +152,42 @@ def select_top_pct(
     threshold = float(top_df["risk_prob"].min())
     print(f"  상위 {top_pct:.1f}% 선별: {len(top_df):,}명 (위험도 >= {threshold:.3f})")
     return top_df.reset_index(drop=True)
+
+
+def select_boundary_pct(
+    scored_df: pd.DataFrame,
+    pct: float = 10.0,
+) -> pd.DataFrame:
+    """
+    Decision boundary 근처 고객 선별 — |risk_prob - 0.5| 최소 N%
+
+    [선택 근거]
+    경계 근처 고객은:
+      - 분류기가 가장 불확실하게 판단하는 구간 (0.5 ± δ)
+      - 소수의 행동 변화만으로도 active ↔ inactive_risk 전환 가능
+      - CF가 현실적으로 실행 가능한 범위 내에서 생성될 가능성 높음
+      - 위험도 최상위 고객(risk ≈ 0.95+)은 대규모 변화 없이는 flip 어려움
+
+    Args:
+        scored_df: score_in_chunks() 결과 DataFrame
+        pct:       선별 비율 (기본 10%)
+    Returns:
+        boundary_df: 경계 근처 N% 고객, |risk_prob - 0.5| 오름차순 정렬
+    """
+    n = max(1, int(len(scored_df) * pct / 100))
+    dist = (scored_df["risk_prob"] - 0.5).abs()
+    idx = dist.nsmallest(n).index
+    boundary_df = scored_df.loc[idx].copy()
+    boundary_df = boundary_df.sort_values(
+        by="risk_prob", ascending=False
+    ).reset_index(drop=True)
+
+    lo = float(boundary_df["risk_prob"].min())
+    hi = float(boundary_df["risk_prob"].max())
+    mid_dist = float(dist.loc[idx].mean())
+    print(f"  경계 근처 {pct:.1f}% 선별: {len(boundary_df):,}명  "
+          f"(risk_prob {lo:.3f}~{hi:.3f}, |prob-0.5| 평균 {mid_dist:.3f})")
+    return boundary_df
 
 
 def detect_device(prefer_gpu: bool = True) -> str:

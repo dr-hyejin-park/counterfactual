@@ -57,7 +57,10 @@ from cf_engine.generator import (
     _feat_name_kr, _feat_unit, _translate_cat,
 )
 from scale.data_loader import iter_chunks, count_rows
-from scale.batch_scorer import score_in_chunks, select_top_pct, detect_device
+from scale.batch_scorer import (
+    score_in_chunks, select_top_pct, select_boundary_pct, detect_device,
+)
+from cf_engine.evaluator import evaluate_all
 from scale.parallel_cf import (
     generate_cf_batched, generate_cf_two_stage, recommend_batch_size
 )
@@ -87,10 +90,18 @@ def parse_args():
     p.add_argument("--data_path",        default="data/hyundai_card_customers.csv")
     p.add_argument("--output_dir",       default="results")
     p.add_argument("--top_pct",          type=float, default=10.0)
+    p.add_argument("--selection_mode",   default="boundary",
+                   choices=["top", "boundary"],
+                   help=(
+                       "고객 선별 방식\n"
+                       "  boundary (기본): decision boundary 근처 10%% — "
+                       "|risk_prob - 0.5| 최소 고객 → 소폭 행동 변화로 flip 가능\n"
+                       "  top             : 위험도 상위 10%% — 가장 위험한 고객"
+                   ))
     p.add_argument("--max_cf_customers", type=int,   default=None,
                    help="CF 생성 상한 인원 (None=무제한, 대규모 시 50000 권장)")
     p.add_argument("--min_risk",         type=float, default=0.0,
-                   help="CF 대상 최소 위험도 (예: 0.6 → 60%% 이상만)")
+                   help="CF 대상 최소 위험도 (boundary 모드에서는 무시됨)")
     # 디바이스
     p.add_argument("--device",           default="auto",
                    help="cpu | cuda | mps | auto (자동 감지)")
@@ -454,10 +465,14 @@ def main():
     print(f"  전체 고객: {total_customers:,}명  |  "
           f"평균 위험도: {scored_df['risk_prob'].mean()*100:.1f}%")
 
-    # ── 상위 N% 선별 ──────────────────────────────────────────────────────────
-    print(f"\n[3단계] 상위 {args.top_pct:.0f}% 고객 선별")
-    top_df = select_top_pct(scored_df, top_pct=args.top_pct,
-                             min_risk_threshold=args.min_risk)
+    # ── N% 고객 선별 ─────────────────────────────────────────────────────────
+    mode_label = "경계 근처" if args.selection_mode == "boundary" else "위험도 상위"
+    print(f"\n[3단계] {mode_label} {args.top_pct:.0f}% 고객 선별")
+    if args.selection_mode == "boundary":
+        top_df = select_boundary_pct(scored_df, pct=args.top_pct)
+    else:
+        top_df = select_top_pct(scored_df, top_pct=args.top_pct,
+                                 min_risk_threshold=args.min_risk)
 
     # ── 원본 피처 데이터 로드 (CF 생성에 전체 피처 컬럼 필요) ──────────────────
     top_ids = set(top_df["customer_id"].values)
@@ -579,6 +594,18 @@ def main():
             for r in results:
                 print_cf_report(r)
         print_aggregated_summary(results, args.top_pct)
+
+    # ── CF 품질 평가 ─────────────────────────────────────────────────────────
+    if results:
+        print(f"\n[5.5단계] CF 품질 평가 (4대 지표)")
+        eval_save = os.path.join(args.output_dir, "cf_evaluation.json")
+        evaluate_all(
+            results=results,
+            preprocessor=preprocessor,
+            max_eval_samples=10000,
+            verbose=True,
+            save_path=eval_save,
+        )
 
     # ── 저장 현황 ─────────────────────────────────────────────────────────────
     print(f"\n[6단계] 저장 현황")
