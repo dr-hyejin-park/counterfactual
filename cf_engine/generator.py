@@ -107,7 +107,11 @@ class TabDiffCFGenerator:
             constraint_fn=lambda xc, xf: self.constraints.apply(xc, xf),
         )
 
-        return self.preprocessor.inverse_transform(x_cf.cpu().numpy())
+        cf_df = self.preprocessor.inverse_transform(x_cf.cpu().numpy())
+        for feat in IMMUTABLE_FEATURES:
+            if feat in cf_df.columns and feat in customer_row.index:
+                cf_df[feat] = customer_row[feat]
+        return cf_df
 
     def generate_for_batch(
         self,
