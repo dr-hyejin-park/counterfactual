@@ -159,13 +159,17 @@ class TabDiffCFGenerator:
         x_cf_np = x_cf_all.cpu().numpy()
 
         # 고객별 슬라이스로 분리 → 개별 DataFrame
+        # float32↔float64 변환 오차로 불변 피처 값이 미세하게 달라지므로 원본값으로 복원
         cf_list = []
         for i in range(n):
             start = i * num_candidates
             end   = start + num_candidates
-            cf_list.append(
-                self.preprocessor.inverse_transform(x_cf_np[start:end])
-            )
+            cf_df = self.preprocessor.inverse_transform(x_cf_np[start:end])
+            factual_row = customer_df.iloc[i]
+            for feat in IMMUTABLE_FEATURES:
+                if feat in cf_df.columns and feat in factual_row.index:
+                    cf_df[feat] = factual_row[feat]
+            cf_list.append(cf_df)
         return cf_list
 
     def generate_cf_direct_opt(
@@ -293,11 +297,17 @@ class TabDiffCFGenerator:
 
         x_cf_np = x.detach().cpu().numpy()
 
+        # float32↔float64 변환 오차로 불변 피처 값이 미세하게 달라지므로 원본값으로 복원
         cf_list = []
         for i in range(n):
             s = i * num_candidates
             e = s + num_candidates
-            cf_list.append(self.preprocessor.inverse_transform(x_cf_np[s:e]))
+            cf_df = self.preprocessor.inverse_transform(x_cf_np[s:e])
+            factual_row = customer_df.iloc[i]
+            for feat in IMMUTABLE_FEATURES:
+                if feat in cf_df.columns and feat in factual_row.index:
+                    cf_df[feat] = factual_row[feat]
+            cf_list.append(cf_df)
         return cf_list
 
     def select_best_cf(self, cf_candidates: pd.DataFrame,
@@ -674,10 +684,15 @@ def build_treatment_rows(result: dict) -> dict:
     for feat in NUMERICAL_FEATURES:
         orig = float(result["factual"].get(feat, 0))
         cf   = float(result["counterfactual"].get(feat, 0))
-        row[f"{feat}_orig"]  = orig
-        row[f"{feat}_cf"]    = cf
-        row[f"{feat}_delta"] = round(cf - orig, 2)
-        row[f"{feat}_pct"]   = round((cf - orig) / orig * 100, 1) if orig != 0 else 0.0
+        row[f"{feat}_orig"] = orig
+        if feat in IMMUTABLE_FEATURES:
+            row[f"{feat}_cf"]    = orig
+            row[f"{feat}_delta"] = 0.0
+            row[f"{feat}_pct"]   = 0.0
+        else:
+            row[f"{feat}_cf"]    = cf
+            row[f"{feat}_delta"] = round(cf - orig, 2)
+            row[f"{feat}_pct"]   = round((cf - orig) / orig * 100, 1) if orig != 0 else 0.0
     for feat in CATEGORICAL_FEATURES:
         row[f"{feat}_orig"]    = str(result["factual"].get(feat, ""))
         row[f"{feat}_cf"]      = str(result["counterfactual"].get(feat, ""))

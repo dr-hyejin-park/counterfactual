@@ -159,7 +159,7 @@ def select_boundary_pct(
     pct: float = 10.0,
 ) -> pd.DataFrame:
     """
-    Decision boundary 근처 고객 선별 — |risk_prob - 0.5| 최소 N%
+    Decision boundary 근처 고객 선별 — risk_prob > 0.5 중 0.5에 가장 가까운 N%
 
     [선택 근거]
     경계 근처 고객은:
@@ -170,23 +170,25 @@ def select_boundary_pct(
 
     Args:
         scored_df: score_in_chunks() 결과 DataFrame
-        pct:       선별 비율 (기본 10%)
+        pct:       선별 비율 (기본 10%, 모수: risk_prob > 0.5 고객 수)
     Returns:
-        boundary_df: 경계 근처 N% 고객, |risk_prob - 0.5| 오름차순 정렬
+        boundary_df: risk_prob > 0.5 중 0.5에 가장 가까운 N% 고객,
+                     risk_prob 오름차순 정렬 (경계에 가까운 순)
     """
-    n = max(1, int(len(scored_df) * pct / 100))
-    dist = (scored_df["risk_prob"] - 0.5).abs()
-    idx = dist.nsmallest(n).index
-    boundary_df = scored_df.loc[idx].copy()
-    boundary_df = boundary_df.sort_values(
-        by="risk_prob", ascending=False
-    ).reset_index(drop=True)
+    at_risk = scored_df[scored_df["risk_prob"] > 0.5].copy()
+    if len(at_risk) == 0:
+        print("  경계 근처 선별 불가: risk_prob > 0.5 고객 없음")
+        return at_risk.reset_index(drop=True)
+
+    n = max(1, int(len(at_risk) * pct / 100))
+    boundary_df = at_risk.sort_values("risk_prob", ascending=True).head(n).reset_index(drop=True)
 
     lo = float(boundary_df["risk_prob"].min())
     hi = float(boundary_df["risk_prob"].max())
-    mid_dist = float(dist.loc[idx].mean())
+    mid_dist = float((boundary_df["risk_prob"] - 0.5).mean())
     print(f"  경계 근처 {pct:.1f}% 선별: {len(boundary_df):,}명  "
-          f"(risk_prob {lo:.3f}~{hi:.3f}, |prob-0.5| 평균 {mid_dist:.3f})")
+          f"(risk_prob > 0.5 모수 {len(at_risk):,}명, "
+          f"선별 범위 {lo:.3f}~{hi:.3f}, prob-0.5 평균 {mid_dist:.3f})")
     return boundary_df
 
 
