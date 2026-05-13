@@ -3,7 +3,7 @@
 **TabDiff 기반 반사실적 설명 시스템 — 고객별 맞춤형 Wake-up Treatment 권고**
 
 > 논문 응용: *"Tabular Diffusion Based Actionable Counterfactual Explanations  
-> for Network Intrusion Detection"* → 현대카드 무실적 위험 고객 활성화 도메인 재적용
+> for Network Intrusion Detection"* → 무실적 위험 고객 활성화 도메인 재적용
 
 ---
 
