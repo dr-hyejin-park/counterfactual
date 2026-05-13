@@ -1,4 +1,4 @@
-# 현대카드 무실적 위험 고객 Wake-up Campaign
+# 무실적 위험 고객 Wake-up Campaign
 
 **TabDiff 기반 반사실적 설명 시스템 — 고객별 맞춤형 Wake-up Treatment 권고**
 
